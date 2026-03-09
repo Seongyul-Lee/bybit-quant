@@ -1,0 +1,25 @@
+strategy:
+  name: MACrossoverStrategy
+  symbol: BTCUSDT
+  timeframe: 1h
+
+params:
+  fast_period: 10
+  slow_period: 30
+  trend_filter: true
+  rsi_filter: true
+  rsi_overbought: 80
+  rsi_oversold: 20
+  volume_filter: true
+  volume_multiplier: 0.7
+  atr_filter: true
+  atr_min_pct: 0.003
+
+execution:
+  order_type: limit       # limit | market
+  limit_offset: 0.001     # 지정가 호가 오프셋 (0.1%)
+
+risk:
+  max_position_pct: 0.05  # 자산의 5%
+  stop_loss_pct: 0.02     # 2% 손절
+  take_profit_pct: 0.04   # 4% 익절

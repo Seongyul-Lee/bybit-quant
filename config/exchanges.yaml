@@ -1,0 +1,17 @@
+# 거래소 설정
+exchange:
+  name: bybit
+  ccxt_class: bybit
+  options:
+    defaultType: linear          # USDT 무기한 선물
+  rate_limit:
+    enabled: true
+    requests_per_second: 5       # 보수적 제한 (초당 5회)
+  symbols:
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+  timeframes:
+    - 1m
+    - 5m
+    - 1h
+    - 1d

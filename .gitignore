@@ -1,0 +1,36 @@
+# API 키 - 절대 커밋 금지
+config/.env*
+config/current_state.json
+
+# 데이터 - 용량 크고 재수집 가능
+data/
+
+# 로그 - 불필요한 변경 추적 방지
+logs/
+
+# 실거래 정보
+reports/live/
+reports/trades/
+
+# 백테스트 결과 - 재실행으로 재생성 가능
+reports/backtest/
+strategies/**/backtest_results/
+
+# ML 모델 - train_lgbm.py로 재생성 가능
+strategies/**/models/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

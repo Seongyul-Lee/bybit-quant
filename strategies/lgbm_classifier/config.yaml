@@ -1,0 +1,21 @@
+strategy:
+  name: LGBMClassifierStrategy
+  symbol: BTCUSDT
+  timeframe: 1h
+
+params:
+  model_path: strategies/lgbm_classifier/models/latest.txt
+  feature_names_path: strategies/lgbm_classifier/models/feature_names.json
+  confidence_threshold: 0.5
+  upper_barrier_multiplier: 2.0
+  lower_barrier_multiplier: 1.0
+  max_holding_period: 24
+
+execution:
+  order_type: limit
+  limit_offset: 0.001
+
+risk:
+  max_position_pct: 0.05
+  stop_loss_pct: 0.02
+  take_profit_pct: 0.04

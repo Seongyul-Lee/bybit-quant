@@ -1,0 +1,17 @@
+position:
+  max_position_pct: 0.05        # 단일 포지션 최대 5%
+  max_concurrent_positions: 3   # 동시 최대 3개
+  max_leverage: 3               # 최대 레버리지 3배
+
+loss_limits:
+  daily_loss_limit_pct: 0.03    # 일일 최대 손실 3%
+  monthly_loss_limit_pct: 0.10  # 월간 최대 손실 10%
+
+circuit_breaker:
+  max_consecutive_losses: 5     # 연속 손실 5회
+  volatility_threshold: 0.05    # 변동성 임계값 5%
+
+trade:
+  default_stop_loss_pct: 0.02   # 기본 손절 2%
+  default_take_profit_pct: 0.04 # 기본 익절 4%
+  risk_per_trade_pct: 0.01      # 거래당 위험 노출 1%
