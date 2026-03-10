@@ -65,7 +65,7 @@ class LGBMClassifierStrategy(BaseStrategy):
         if last_row.isna().any(axis=1).iloc[0]:
             return 0
 
-        proba = self.model.predict_proba(last_row)[0]  # [p_down, p_neutral, p_up]
+        proba = self.model.predict(last_row)[0]  # [p_down, p_neutral, p_up]
         max_idx = int(np.argmax(proba))
         max_prob = proba[max_idx]
 
@@ -93,7 +93,7 @@ class LGBMClassifierStrategy(BaseStrategy):
             return signals
 
         X_valid = X[valid_mask]
-        proba = self.model.predict_proba(X_valid)  # (n, 3)
+        proba = self.model.predict(X_valid)  # (n, 3)
 
         max_idx = np.argmax(proba, axis=1)
         max_prob = np.max(proba, axis=1)
@@ -107,11 +107,11 @@ class LGBMClassifierStrategy(BaseStrategy):
 
         return signals
 
-    def _load_model(self) -> lgb.LGBMClassifier:
-        """저장된 LightGBM 모델 로드.
+    def _load_model(self) -> lgb.Booster:
+        """저장된 LightGBM Booster 모델 로드.
 
         Returns:
-            LGBMClassifier 인스턴스.
+            lgb.Booster 인스턴스.
 
         Raises:
             FileNotFoundError: 모델 파일이 없는 경우.
@@ -127,13 +127,7 @@ class LGBMClassifierStrategy(BaseStrategy):
                 f"먼저 train_lgbm.py로 모델을 학습하세요."
             )
 
-        booster = lgb.Booster(model_file=model_path)
-        model = lgb.LGBMClassifier()
-        model._Booster = booster
-        model._n_classes = 3
-        model.fitted_ = True
-
-        return model
+        return lgb.Booster(model_file=model_path)
 
     def _load_feature_names(self) -> list[str]:
         """피처 이름 목록 로드.

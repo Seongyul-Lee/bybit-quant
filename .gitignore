@@ -2,8 +2,10 @@
 config/.env*
 config/current_state.json
 
-# 데이터 - 용량 크고 재수집 가능
-data/
+# Raw 데이터 - 재수집 가능하나 모델 재현을 위해 추적
+# data/raw/  ← 추적 대상 (모델 학습 데이터 재현에 필수)
+# data/processed/  ← 추적 대상 (모델 성과와 직결)
+data/tmp/
 
 # 로그 - 불필요한 변경 추적 방지
 logs/
@@ -16,8 +18,9 @@ reports/trades/
 reports/backtest/
 strategies/**/backtest_results/
 
-# ML 모델 - train_lgbm.py로 재생성 가능
-strategies/**/models/
+# ML 모델 - 성과 좋은 모델은 커밋+태그로 보존
+# strategies/**/models/  ← 추적 대상
+strategies/**/models/*_backup/
 
 # Python
 __pycache__/

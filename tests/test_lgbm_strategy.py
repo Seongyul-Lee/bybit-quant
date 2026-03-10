@@ -76,7 +76,7 @@ class TestLGBMClassifierStrategy:
         """generate_signal이 int를 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
         # mock 모델이 중립을 반환하도록 설정
-        strategy.model.predict_proba.return_value = np.array([[0.1, 0.8, 0.1]])
+        strategy.model.predict.return_value = np.array([[0.1, 0.8, 0.1]])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert isinstance(signal, (int, np.integer))
@@ -88,7 +88,7 @@ class TestLGBMClassifierStrategy:
         """높은 매수 확률이면 1을 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
         # p_up(class 2) = 0.7 → 매수
-        strategy.model.predict_proba.return_value = np.array([[0.1, 0.2, 0.7]])
+        strategy.model.predict.return_value = np.array([[0.1, 0.2, 0.7]])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert signal == 1
@@ -99,7 +99,7 @@ class TestLGBMClassifierStrategy:
         """높은 매도 확률이면 -1을 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
         # p_down(class 0) = 0.7 → 매도
-        strategy.model.predict_proba.return_value = np.array([[0.7, 0.2, 0.1]])
+        strategy.model.predict.return_value = np.array([[0.7, 0.2, 0.1]])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert signal == -1
@@ -110,7 +110,7 @@ class TestLGBMClassifierStrategy:
         """모든 확률이 threshold 미만이면 0을 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files, confidence=0.5)
         # 최대 확률 = 0.4 < 0.5 → 중립
-        strategy.model.predict_proba.return_value = np.array([[0.3, 0.4, 0.3]])
+        strategy.model.predict.return_value = np.array([[0.3, 0.4, 0.3]])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert signal == 0
@@ -125,7 +125,7 @@ class TestLGBMClassifierStrategy:
         def dynamic_proba(X):
             return np.tile([0.1, 0.8, 0.1], (len(X), 1))
 
-        strategy.model.predict_proba.side_effect = dynamic_proba
+        strategy.model.predict.side_effect = dynamic_proba
 
         signals = strategy.generate_signals_vectorized(sample_ohlcv)
         assert isinstance(signals, pd.Series)
@@ -141,7 +141,7 @@ class TestLGBMClassifierStrategy:
         def dynamic_proba(X):
             return np.tile([0.3, 0.4, 0.3], (len(X), 1))
 
-        strategy.model.predict_proba.side_effect = dynamic_proba
+        strategy.model.predict.side_effect = dynamic_proba
 
         signals = strategy.generate_signals_vectorized(sample_ohlcv)
         assert (signals == 0).all()
@@ -157,3 +157,59 @@ class TestLGBMClassifierStrategy:
         from src.strategies.base import BaseStrategy
         strategy = _create_mock_strategy(mock_model_files)
         assert isinstance(strategy, BaseStrategy)
+
+    def test_vectorized_matches_sequential(
+        self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
+    ) -> None:
+        """Defect #7: generate_signal() 순차 호출과 generate_signals_vectorized() 결과가 일치하는지 검증.
+
+        warmup 구간(처음 200봉) 이후 구간에서 동일한 신호를 반환해야 한다.
+        """
+        strategy = _create_mock_strategy(mock_model_files, confidence=0.5)
+
+        # mock 모델: 피처 값 기반으로 결정론적 결과를 반환하도록 설정
+        # 첫 번째 피처의 NaN 여부와 합계로 분류를 결정
+        def deterministic_predict(X):
+            """피처 합계 기반으로 결정론적 확률 반환."""
+            if isinstance(X, pd.DataFrame):
+                X_arr = X.values
+            else:
+                X_arr = np.asarray(X)
+
+            results = []
+            for row in X_arr:
+                if np.any(np.isnan(row)):
+                    results.append([0.1, 0.8, 0.1])  # 중립
+                else:
+                    s = np.sum(row)
+                    # 합계를 기반으로 결정론적 확률 생성
+                    if s % 3 < 1:
+                        results.append([0.7, 0.2, 0.1])  # 매도
+                    elif s % 3 < 2:
+                        results.append([0.1, 0.8, 0.1])  # 중립
+                    else:
+                        results.append([0.1, 0.2, 0.7])  # 매수
+            return np.array(results)
+
+        strategy.model.predict.side_effect = deterministic_predict
+
+        # 벡터화 신호 생성
+        vec_signals = strategy.generate_signals_vectorized(sample_ohlcv)
+
+        # 순차 신호 생성 (warmup 200봉 이후부터 비교)
+        warmup = 200
+        mismatches = 0
+        total_compared = 0
+
+        for i in range(warmup, len(sample_ohlcv)):
+            seq_signal = strategy.generate_signal(sample_ohlcv.iloc[: i + 1])
+            if vec_signals.iloc[i] != seq_signal:
+                mismatches += 1
+            total_compared += 1
+
+        # warmup 이후 구간에서 불일치율이 1% 이하여야 함
+        mismatch_rate = mismatches / total_compared if total_compared > 0 else 0.0
+        assert mismatch_rate <= 0.01, (
+            f"벡터화 vs 순차 신호 불일치율 {mismatch_rate:.2%} "
+            f"({mismatches}/{total_compared}건) — 1% 초과"
+        )

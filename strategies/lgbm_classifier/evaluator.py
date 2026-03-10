@@ -86,13 +86,14 @@ class ModelEvaluator:
         }
 
     @staticmethod
-    def trading_metrics(returns: pd.Series) -> dict:
+    def trading_metrics(returns: pd.Series, timeframe: str = "1d") -> dict:
         """트레이딩 성과 지표 계산 (Reporter.calculate_metrics 재활용).
 
         Args:
             returns: 수익률 시리즈.
+            timeframe: 데이터 타임프레임 (연환산 계수 결정에 사용).
 
         Returns:
             Reporter.calculate_metrics() 결과.
         """
-        return Reporter.calculate_metrics(returns)
+        return Reporter.calculate_metrics(returns, timeframe=timeframe)

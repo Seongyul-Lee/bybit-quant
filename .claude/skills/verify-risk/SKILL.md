@@ -24,8 +24,9 @@ description: 리스크 관리 규칙 준수 여부를 검증합니다. 리스크
 | File | Purpose |
 |------|---------|
 | `config/risk_params.yaml` | 리스크 파라미터 설정 |
-| `src/risk/manager.py` | RiskManager + CircuitBreaker 구현 |
-| `main.py` | 실거래 루프 (check_all 호출 위치) |
+| `src/risk/manager.py` | RiskManager + CircuitBreaker + PnLTracker 구현 |
+| `src/execution/executor.py` | _save_state (extra_state로 CB/PnLTracker 저장) |
+| `main.py` | 실거래 루프 (check_all 호출 위치, PnLTracker 사용) |
 | `CLAUDE.md` | 프로젝트 지침 (리스크 파라미터 문서) |
 
 ## Workflow
@@ -126,6 +127,56 @@ Grep pattern="leverage|set_leverage" glob="*.py" path="main.py"
 **PASS:** 레버리지가 설정 파일의 max_leverage로 제한되거나, 레버리지 관련 코드가 없음
 **FAIL:** max_leverage를 초과하는 하드코딩된 레버리지 값이 존재
 
+### Step 5: PnLTracker 일관성 검증
+
+**파일:** `src/risk/manager.py`, `main.py`
+
+**도구:** Read, Grep
+
+```bash
+# PnLTracker 클래스 존재 확인
+Grep pattern="class PnLTracker" path="src/risk/manager.py" output_mode="content"
+
+# to_dict/from_dict 메서드 존재 확인
+Grep pattern="def (to_dict|from_dict)" path="src/risk/manager.py" output_mode="content"
+
+# main.py에서 PnLTracker 사용 확인
+Grep pattern="PnLTracker|pnl_tracker" path="main.py" output_mode="content"
+```
+
+**검증:**
+1. PnLTracker 클래스가 `to_dict()`/`from_dict()` 직렬화 메서드를 구현하는지
+2. `to_dict()`가 반환하는 키 집합과 `from_dict()`가 복원하는 키 집합이 일치하는지
+3. main.py에서 PnLTracker를 생성하고 `record_pnl()`로 거래 PnL을 기록하는지
+4. main.py에서 `check_all()`에 `monthly_pnl=pnl_tracker.monthly_pnl`을 전달하는지
+
+**PASS:** PnLTracker 직렬화가 완전하고, main.py에서 올바르게 사용
+**FAIL:** 직렬화 키 불일치, 또는 main.py에서 check_all에 monthly_pnl 미전달
+
+### Step 6: CircuitBreaker 상태 저장/복원 검증
+
+**파일:** `src/risk/manager.py`, `main.py`
+
+**도구:** Read, Grep
+
+```bash
+# CircuitBreaker to_dict/from_dict 확인
+Grep pattern="class CircuitBreaker" path="src/risk/manager.py" output_mode="content" -A=5
+Grep pattern="def (to_dict|from_dict)" path="src/risk/manager.py" output_mode="content"
+
+# main.py에서 상태 복원 확인
+Grep pattern="from_dict|circuit_breaker" path="main.py" output_mode="content"
+```
+
+**검증:**
+1. CircuitBreaker가 `to_dict()`/`from_dict()` 메서드를 구현하는지
+2. `to_dict()`가 `consecutive_losses`와 `is_tripped`를 포함하는지
+3. main.py에서 프로세스 시작 시 `current_state.json`에서 CircuitBreaker 상태를 `from_dict()`로 복원하는지
+4. main.py에서 매 순환마다 `_save_state(extra_state={..., "circuit_breaker": cb.to_dict(), ...})`로 저장하는지
+
+**PASS:** CircuitBreaker 상태가 프로세스 재시작 시 유지됨
+**FAIL:** to_dict/from_dict 미구현, 또는 main.py에서 상태 저장/복원 누락
+
 ## Output Format
 
 ```markdown
@@ -137,6 +188,8 @@ Grep pattern="leverage|set_leverage" glob="*.py" path="main.py"
 | 2 | CircuitBreaker 자동 리셋 금지 | PASS/FAIL | 발견된 자동 리셋... |
 | 3 | check_all 우선 실행 | PASS/FAIL | 코드 흐름 분석... |
 | 4 | 레버리지 제한 | PASS/FAIL | 초과 레버리지... |
+| 5 | PnLTracker 일관성 | PASS/FAIL | 직렬화/사용 상태... |
+| 6 | CircuitBreaker 상태 저장/복원 | PASS/FAIL | to_dict/from_dict... |
 ```
 
 ## Exceptions

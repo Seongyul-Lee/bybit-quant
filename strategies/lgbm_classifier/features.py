@@ -64,6 +64,65 @@ class FeatureEngine:
         """
         return self._feature_names
 
+    def get_selected_features(self) -> list[str]:
+        """과적합 방지를 위해 선별된 피처만 반환.
+
+        47개 전체 피처에서 중복·가격수준의존 피처를 제거하고
+        정규화된 ~18개 피처만 선택한다.
+
+        Returns:
+            선별된 피처 컬럼 이름 리스트.
+        """
+        selected = [
+            # 정규화된 MA 비율 (4개)
+            "ma_10_ratio", "ma_30_ratio", "ma_50_ratio", "ma_200_ratio",
+            # 모멘텀 (3개)
+            "rsi_14", "macd_hist", "stoch_k",
+            # 변동성 (3개)
+            "atr_14_pct", "bb_width", "bb_position",
+            # 추세 (1개)
+            "adx_14",
+            # 가격 파생 (3개)
+            "return_1", "return_5", "return_20",
+            # 거래량 (1개)
+            "volume_ratio",
+            # 시간 (2개)
+            "hour_sin", "hour_cos",
+            # 멀티타임프레임 (2개)
+            "rsi_14_1d", "ma_50_1d_ratio",
+        ]
+        return [f for f in selected if f in self._feature_names]
+
+    @staticmethod
+    def remove_correlated_features(
+        X: pd.DataFrame,
+        feature_names: list[str],
+        threshold: float = 0.9,
+    ) -> list[str]:
+        """상관관계가 높은 피처를 자동 제거.
+
+        피처 쌍의 Pearson 상관계수가 threshold 이상이면
+        중요도가 낮은 쪽(뒤에 나오는 쪽)을 제거한다.
+
+        Args:
+            X: 피처 데이터프레임.
+            feature_names: 대상 피처 이름 목록.
+            threshold: 상관계수 제거 기준 (기본 0.9).
+
+        Returns:
+            상관관계 필터링 후 남은 피처 이름 리스트.
+        """
+        corr = X[feature_names].corr().abs()
+        upper = corr.where(
+            np.triu(np.ones(corr.shape, dtype=bool), k=1)
+        )
+        to_drop = set()
+        for col in upper.columns:
+            if any(upper[col] > threshold):
+                to_drop.add(col)
+        remaining = [f for f in feature_names if f not in to_drop]
+        return remaining
+
     # ── 기술적 지표 ──────────────────────────────────────────
 
     def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -92,7 +151,9 @@ class FeatureEngine:
         df["bb_upper"] = bb_mid + 2 * bb_std
         df["bb_lower"] = bb_mid - 2 * bb_std
         df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / bb_mid
-        df["bb_position"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
+        bb_range = (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
+        df["bb_position"] = (df["close"] - df["bb_lower"]) / bb_range
+        df["bb_position"] = df["bb_position"].fillna(0.5)  # 밴드폭 0이면 중앙
 
         # ATR
         df["atr_14"] = self._get_or_compute_atr(df)
@@ -213,9 +274,11 @@ class FeatureEngine:
         return df["close"].rolling(period).mean()
 
     def _get_or_compute_rsi(self, df: pd.DataFrame) -> pd.Series:
-        """processor의 rsi_14가 있으면 재활용, 없으면 계산."""
+        """processor의 rsi_14가 있으면 재활용, NaN이 과다하면 재계산."""
         if "rsi_14" in df.columns:
-            return df["rsi_14"]
+            nan_ratio = df["rsi_14"].isna().mean()
+            if nan_ratio < 0.05:
+                return df["rsi_14"]
         return self._compute_rsi_series(df["close"], 14)
 
     def _get_or_compute_atr(self, df: pd.DataFrame) -> pd.Series:
@@ -232,12 +295,22 @@ class FeatureEngine:
 
     @staticmethod
     def _compute_rsi_series(series: pd.Series, period: int) -> pd.Series:
-        """RSI 계산."""
+        """RSI 계산.
+
+        loss=0 (하락 없음)이면 RSI=100, gain과 loss 모두 0이면 RSI=50.
+        """
         delta = series.diff()
         gain = delta.where(delta > 0, 0.0).rolling(period).mean()
         loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
         rs = gain / loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs))
+        # loss=0 & gain>0 → RSI=100, 둘 다 0 → RSI=50
+        both_zero = (gain == 0) & (loss == 0)
+        only_gain = (gain > 0) & (loss == 0)
+        rsi = rsi.fillna(rsi)  # keep NaN from rolling warmup
+        rsi.loc[only_gain] = 100.0
+        rsi.loc[both_zero] = 50.0
+        return rsi
 
     @staticmethod
     def _compute_atr_series(df: pd.DataFrame, period: int) -> pd.Series:
@@ -250,10 +323,12 @@ class FeatureEngine:
 
     @staticmethod
     def _compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """ADX(Average Directional Index) 계산."""
+        """ADX(Average Directional Index) 계산.
+
+        DI 합이 0인 구간(gap fill 등)에서는 DX=0으로 처리.
+        """
         high = df["high"]
         low = df["low"]
-        close = df["close"]
 
         plus_dm = high.diff()
         minus_dm = -low.diff()
@@ -266,7 +341,9 @@ class FeatureEngine:
         plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
         minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
 
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        di_sum = plus_di + minus_di
+        dx = 100 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)
+        dx = dx.fillna(0.0)  # DI 합이 0이면 방향성 없음 → DX=0
         adx = dx.rolling(period).mean()
 
         return adx

@@ -45,7 +45,8 @@ class WalkForwardTrainer:
         "num_class": 3,
         "metric": "multi_logloss",
         "n_estimators": 1000,
-        "bagging_freq": 5,
+        "bagging_freq": 1,
+        "max_depth": 6,
         "class_weight": "balanced",
         "verbose": -1,
     }
@@ -56,6 +57,9 @@ class WalkForwardTrainer:
         val_months: int = 1,
         embargo_bars: int = 24,
         n_optuna_trials: int = 50,
+        max_overfit_gap: float = 0.3,
+        use_sliding_window: bool = False,
+        sliding_window_months: int = 12,
     ) -> None:
         """WalkForwardTrainer 초기화.
 
@@ -64,11 +68,17 @@ class WalkForwardTrainer:
             val_months: 각 fold의 검증 기간 (월).
             embargo_bars: 학습 끝~검증 시작 사이 제거할 봉 수.
             n_optuna_trials: Optuna 하이퍼파라미터 탐색 시행 수.
+            max_overfit_gap: 모델 후보 제외 기준 과적합 갭 (train_f1 - val_f1).
+            use_sliding_window: True면 슬라이딩 윈도우, False면 확장 윈도우.
+            sliding_window_months: 슬라이딩 윈도우 시 학습 데이터 최대 기간 (월).
         """
         self.min_train_months = min_train_months
         self.val_months = val_months
         self.embargo_bars = embargo_bars
         self.n_optuna_trials = n_optuna_trials
+        self.max_overfit_gap = max_overfit_gap
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window_months = sliding_window_months
 
     def generate_folds(self, df: pd.DataFrame) -> list[dict]:
         """Walk-Forward fold를 생성.
@@ -98,7 +108,15 @@ class WalkForwardTrainer:
             if val_end > end_date:
                 break
 
-            train_mask = timestamps < val_start
+            # 슬라이딩 윈도우: 학습 시작을 제한하여 최근 데이터만 사용
+            if self.use_sliding_window:
+                train_start_limit = val_start - pd.DateOffset(
+                    months=self.sliding_window_months
+                )
+                train_mask = (timestamps >= train_start_limit) & (timestamps < val_start)
+            else:
+                train_mask = timestamps < val_start
+
             # embargo 적용: 학습 끝에서 embargo_bars 제거
             train_idx = df.index[train_mask].tolist()
             if len(train_idx) > self.embargo_bars:
@@ -122,7 +140,8 @@ class WalkForwardTrainer:
 
             val_start = val_end
 
-        logger.info(f"Walk-Forward fold 생성: {len(folds)}개")
+        window_type = "슬라이딩" if self.use_sliding_window else "확장"
+        logger.info(f"Walk-Forward fold 생성: {len(folds)}개 ({window_type} 윈도우)")
         return folds
 
     def optimize_hyperparams(
@@ -150,20 +169,20 @@ class WalkForwardTrainer:
         def objective(trial: optuna.Trial) -> float:
             params = {
                 **self.FIXED_PARAMS,
-                "num_leaves": trial.suggest_int("num_leaves", 15, 63),
-                "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
+                "num_leaves": trial.suggest_int("num_leaves", 20, 63),
+                "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
-                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 0.9),
-                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.9),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.01, 2.0, log=True),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.3, 0.6),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.8),
             }
 
             model = lgb.LGBMClassifier(**params)
             model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
-                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+                callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
             )
 
             y_pred = model.predict(X_val)
@@ -202,7 +221,7 @@ class WalkForwardTrainer:
         model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
         )
 
         y_pred_train = model.predict(X_train)
@@ -211,7 +230,7 @@ class WalkForwardTrainer:
 
         train_f1 = f1_score(y_train, y_pred_train, average="macro")
         val_f1 = f1_score(y_val, y_pred_val, average="macro")
-        val_logloss = log_loss(y_val, y_proba_val)
+        val_logloss = log_loss(y_val, y_proba_val, labels=[0, 1, 2])
 
         fold_metrics = {
             "train_f1_macro": float(train_f1),
@@ -267,18 +286,18 @@ class WalkForwardTrainer:
         else:
             best_params = {
                 **self.FIXED_PARAMS,
-                "num_leaves": 31,
-                "min_child_samples": 50,
+                "num_leaves": 23,
+                "min_child_samples": 100,
                 "learning_rate": 0.05,
-                "reg_alpha": 0.1,
-                "reg_lambda": 0.1,
-                "feature_fraction": 0.8,
-                "bagging_fraction": 0.8,
+                "reg_alpha": 1.0,
+                "reg_lambda": 1.0,
+                "feature_fraction": 0.6,
+                "bagging_fraction": 0.6,
             }
 
         # 모든 fold에서 학습
         folds_metrics = []
-        last_model = None
+        fold_models: list[lgb.LGBMClassifier] = []
 
         for i, fold in enumerate(folds):
             logger.info(
@@ -296,21 +315,61 @@ class WalkForwardTrainer:
             metrics["fold"] = i
             metrics["train_period"] = f"{fold['train_start']} ~ {fold['train_end']}"
             metrics["val_period"] = f"{fold['val_start']} ~ {fold['val_end']}"
-            folds_metrics.append(metrics)
-            last_model = model
 
-        # 피처 중요도 (마지막 fold 모델 기준)
+            # 과적합 갭 계산
+            overfit_gap = metrics["train_f1_macro"] - metrics["val_f1_macro"]
+            metrics["overfit_gap"] = float(overfit_gap)
+            if overfit_gap > self.max_overfit_gap:
+                logger.warning(
+                    f"  Fold {i}: 과적합 심각 (gap={overfit_gap:.4f} > {self.max_overfit_gap}) "
+                    f"— 모델 후보에서 제외"
+                )
+
+            folds_metrics.append(metrics)
+            fold_models.append(model)
+
+        # 모델 선택: 최신 fold부터 역순으로, gap ≤ threshold인 첫 번째 fold 선택
+        # 모두 threshold 초과 시 최신 fold 사용 (경고 출력)
+        selected_model = None
+        selected_fold_idx = -1
+
+        for i in range(len(folds) - 1, -1, -1):
+            gap = folds_metrics[i]["overfit_gap"]
+            if gap <= self.max_overfit_gap:
+                selected_model = fold_models[i]
+                selected_fold_idx = i
+                logger.info(
+                    f"모델 선택: Fold {i} (Val F1: {folds_metrics[i]['val_f1_macro']:.4f}, "
+                    f"gap: {gap:.4f}) — 최신 적합 fold"
+                )
+                break
+
+        if selected_model is None:
+            # 모든 fold가 과적합 — 최신 fold 사용 (가장 많은 데이터로 학습됨)
+            selected_model = fold_models[-1]
+            selected_fold_idx = len(folds) - 1
+            logger.warning(
+                f"모든 fold가 과적합 (gap > {self.max_overfit_gap}). "
+                f"최신 Fold {selected_fold_idx} 사용 "
+                f"(Val F1: {folds_metrics[selected_fold_idx]['val_f1_macro']:.4f})"
+            )
+
+        selected_val_f1 = folds_metrics[selected_fold_idx]["val_f1_macro"]
+
+        # 피처 중요도 (선택된 fold 모델 기준)
         importance = dict(zip(
             feature_names,
-            [int(x) for x in last_model.feature_importances_],
+            [int(x) for x in selected_model.feature_importances_],
         ))
 
         return {
-            "model": last_model,
+            "model": selected_model,
             "params": best_params,
             "feature_names": feature_names,
             "folds_metrics": folds_metrics,
             "feature_importance": importance,
+            "best_fold_idx": selected_fold_idx,
+            "best_val_f1": selected_val_f1,
         }
 
     def save_model(
@@ -321,6 +380,8 @@ class WalkForwardTrainer:
         folds_metrics: list[dict],
         feature_importance: dict,
         save_dir: str,
+        best_fold_idx: int = -1,
+        best_val_f1: float = 0.0,
     ) -> str:
         """학습 결과를 atomic write로 저장.
 
@@ -356,6 +417,8 @@ class WalkForwardTrainer:
 
         meta = {
             "n_folds": len(folds_metrics),
+            "best_fold_idx": best_fold_idx,
+            "best_val_f1": best_val_f1,
             "folds_metrics": folds_metrics,
             "feature_importance": feature_importance,
         }
@@ -370,7 +433,7 @@ class WalkForwardTrainer:
         dir_path = os.path.dirname(path)
         fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
             shutil.move(tmp_path, path)
         except Exception:

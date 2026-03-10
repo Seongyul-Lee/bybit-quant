@@ -19,6 +19,8 @@ description: ML 전략(LightGBM) 전용 규칙 준수 여부를 검증합니다.
 | 8 | config.yaml ML 파라미터 | confidence_threshold 범위, 경로 정합성 |
 | 9 | generate_signal ↔ vectorized 일관성 | 두 메서드의 로직 동치 |
 | 10 | 과적합 체크 통합 | train_lgbm.py에서 ModelEvaluator.check_overfitting 호출 |
+| 11 | 피처 선별 파이프라인 일관성 | 학습/추론이 동일한 피처 선별 로직 사용 |
+| 12 | Best Fold 선택 로직 | overfit_gap 기반 fold 선택이 올바르게 구현 |
 
 ## When to Run
 
@@ -248,8 +250,10 @@ strategy.py를 Read로 읽고 두 메서드의 로직을 비교한다.
 1. 두 메서드 모두 `self.feature_engine.compute_all_features(df)` 호출
 2. 두 메서드 모두 `self.feature_names`로 동일한 피처 컬럼 선택
 3. 두 메서드 모두 NaN 행에 대해 0(중립) 반환
-4. 두 메서드 모두 `self.model.predict_proba()` → `argmax` → `self.confidence_threshold` 비교 → `self._LABEL_MAP_INV` 역매핑 동일 순서
+4. 두 메서드 모두 `self.model.predict()` → `argmax` → `self.confidence_threshold` 비교 → `self._LABEL_MAP_INV` 역매핑 동일 순서 (Booster.predict()는 확률 배열 반환)
 5. confidence_threshold 미만일 때 두 메서드 모두 0 반환
+
+**주의:** 모델이 `lgb.Booster`이므로 `predict()`가 확률을 직접 반환한다 (`predict_proba()`가 아님). 두 메서드 모두 `self.model.predict()`를 사용하는지 확인.
 
 두 메서드의 결과가 달라지면 실거래(generate_signal)와 백테스트(generate_signals_vectorized)가 다른 신호를 생성하게 되어 백테스트 신뢰성이 무너진다.
 
@@ -275,6 +279,53 @@ Grep pattern="ModelEvaluator" path="train_lgbm.py" output_mode="content"
 **PASS:** check_overfitting이 모든 fold에 대해 호출 + 경고 로그 존재
 **FAIL:** check_overfitting 미호출 또는 경고 누락
 
+### Step 11: 피처 선별 파이프라인 일관성 검증
+
+**파일:** `strategies/lgbm_classifier/features.py`, `train_lgbm.py`, `strategies/lgbm_classifier/strategy.py`
+
+```
+Grep pattern="get_selected_features|remove_correlated_features" path="strategies/lgbm_classifier/features.py" output_mode="content"
+Grep pattern="get_selected_features|remove_correlated_features|use.all.features" path="train_lgbm.py" output_mode="content"
+```
+
+**검증:**
+1. `FeatureEngine.get_selected_features()`가 존재하고, 선별된 피처 이름 리스트를 반환하는지
+2. `train_lgbm.py`에서 `--use-all-features` 플래그에 따라 `get_selected_features()` 또는 `compute_all_features()` 분기가 존재하는지
+3. 학습 시 사용된 피처 이름이 `feature_names.json`에 저장되는지 (Step 3 save_model과 연계)
+4. strategy.py는 `feature_names.json`에서 로드한 피처만 사용하므로 학습/추론 일관성이 JSON 파일을 통해 보장되는지
+
+**핵심 원리:** 학습 시 어떤 피처를 선별하든 `feature_names.json`에 저장하면 strategy.py가 동일 피처를 사용한다. 하지만 `FeatureEngine.compute_all_features()`가 해당 피처를 생성하지 않으면 KeyError가 발생한다.
+
+```
+# strategy.py가 feature_names.json에서 로드하는지 확인 (Step 3에서 이미 검증하지만 재확인)
+Grep pattern="feature_names" path="strategies/lgbm_classifier/strategy.py" output_mode="content"
+```
+
+**PASS:** 학습 시 선별된 피처가 feature_names.json에 저장되고, strategy.py가 이를 로드하여 사용
+**FAIL:** 피처 선별 후 feature_names.json 미저장, 또는 compute_all_features()에 없는 피처가 포함
+
+### Step 12: Best Fold 선택 로직 검증
+
+**파일:** `strategies/lgbm_classifier/trainer.py`
+
+**도구:** Read
+
+trainer.py의 `run()` 메서드 마지막 부분에서 best fold 선택 로직을 읽고 확인합니다:
+
+```
+Grep pattern="overfit_gap|best_fold|max_overfit_gap" path="strategies/lgbm_classifier/trainer.py" output_mode="content"
+```
+
+**검증:**
+1. 각 fold의 `overfit_gap = train_f1 - val_f1`이 계산되는지
+2. 최신 fold부터 역순으로 `overfit_gap <= max_overfit_gap`인 첫 번째 fold를 선택하는지
+3. 모든 fold가 threshold 초과 시 최신 fold를 사용하되 경고를 출력하는지
+4. `save_model()`에 `best_fold_idx`와 `best_val_f1`이 전달되는지
+5. `training_meta.json`에 `best_fold_idx`가 저장되는지
+
+**PASS:** best fold 선택이 overfit_gap 기반으로 올바르게 구현
+**FAIL:** 단순히 마지막 fold만 사용하거나, overfit_gap 미계산
+
 ## Output Format
 
 ```markdown
@@ -292,6 +343,8 @@ Grep pattern="ModelEvaluator" path="train_lgbm.py" output_mode="content"
 | 8 | config.yaml ML 파라미터 | config.yaml + strategy.py | PASS/FAIL | ... |
 | 9 | signal ↔ vectorized 일관성 | strategy.py | PASS/FAIL | ... |
 | 10 | 과적합 체크 통합 | train_lgbm.py + evaluator.py | PASS/FAIL | ... |
+| 11 | 피처 선별 파이프라인 일관성 | features.py + train_lgbm.py + strategy.py | PASS/FAIL | ... |
+| 12 | Best Fold 선택 로직 | trainer.py | PASS/FAIL | ... |
 ```
 
 ## Exceptions

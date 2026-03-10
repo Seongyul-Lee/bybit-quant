@@ -6,6 +6,7 @@
 """
 
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 import yaml
@@ -81,6 +82,87 @@ class CircuitBreaker:
         self.consecutive_losses = 0
         logger.info("Circuit Breaker 수동 리셋 완료")
 
+    def to_dict(self) -> dict:
+        """직렬화용 딕셔너리 반환."""
+        return {
+            "consecutive_losses": self.consecutive_losses,
+            "is_tripped": self.is_tripped,
+        }
+
+    def from_dict(self, data: dict) -> None:
+        """딕셔너리로부터 상태 복원.
+
+        Args:
+            data: to_dict()로 생성된 상태 딕셔너리.
+        """
+        self.consecutive_losses = data.get("consecutive_losses", 0)
+        self.is_tripped = data.get("is_tripped", False)
+
+
+class PnLTracker:
+    """일일/월간 손익을 추적하는 클래스.
+
+    날짜 변경 시 일일 PnL을 리셋하고,
+    월 변경 시 월간 PnL을 리셋한다.
+
+    Attributes:
+        daily_pnl: 금일 누적 손익.
+        monthly_pnl: 당월 누적 손익.
+    """
+
+    def __init__(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.daily_pnl: float = 0.0
+        self.monthly_pnl: float = 0.0
+        self._current_date: str = now.strftime("%Y-%m-%d")
+        self._current_month: str = now.strftime("%Y-%m")
+
+    def record_pnl(self, pnl: float) -> None:
+        """거래 PnL을 기록하고, 날짜/월 변경 시 자동 리셋.
+
+        Args:
+            pnl: 개별 거래 손익.
+        """
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        month = now.strftime("%Y-%m")
+
+        if month != self._current_month:
+            logger.info(f"월 변경 감지: {self._current_month} → {month}, 월간 PnL 리셋")
+            self.monthly_pnl = 0.0
+            self._current_month = month
+            self.daily_pnl = 0.0
+            self._current_date = today
+
+        if today != self._current_date:
+            logger.info(f"날짜 변경 감지: {self._current_date} → {today}, 일일 PnL 리셋")
+            self.daily_pnl = 0.0
+            self._current_date = today
+
+        self.daily_pnl += pnl
+        self.monthly_pnl += pnl
+        logger.info(f"PnL 기록: {pnl:+.2f} (일일: {self.daily_pnl:+.2f}, 월간: {self.monthly_pnl:+.2f})")
+
+    def to_dict(self) -> dict:
+        """직렬화용 딕셔너리 반환."""
+        return {
+            "daily_pnl": self.daily_pnl,
+            "monthly_pnl": self.monthly_pnl,
+            "current_date": self._current_date,
+            "current_month": self._current_month,
+        }
+
+    def from_dict(self, data: dict) -> None:
+        """딕셔너리로부터 상태 복원.
+
+        Args:
+            data: to_dict()로 생성된 상태 딕셔너리.
+        """
+        self.daily_pnl = data.get("daily_pnl", 0.0)
+        self.monthly_pnl = data.get("monthly_pnl", 0.0)
+        self._current_date = data.get("current_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        self._current_month = data.get("current_month", datetime.now(timezone.utc).strftime("%Y-%m"))
+
 
 class RiskManager:
     """리스크 관리 총괄 클래스.
@@ -144,6 +226,7 @@ class RiskManager:
         self,
         portfolio_value: float,
         atr: float,
+        entry_price: float,
         risk_per_trade: Optional[float] = None,
     ) -> float:
         """ATR 기반 변동성 조절 포지션 사이징.
@@ -153,19 +236,23 @@ class RiskManager:
         Args:
             portfolio_value: 총 포트폴리오 가치.
             atr: 현재 ATR 값.
+            entry_price: 진입 가격 (max_position_pct 상한을 수량 단위로 변환에 사용).
             risk_per_trade: 거래당 위험 비율. None이면 설정 파일 기본값 사용.
 
         Returns:
             계산된 포지션 사이즈 (수량 단위).
         """
+        if entry_price <= 0:
+            return 0.0
         risk_pct = risk_per_trade or self.params["trade"]["risk_per_trade_pct"]
         dollar_risk = portfolio_value * risk_pct
         if atr <= 0:
             return 0.0
         position_size = dollar_risk / atr
 
-        max_size = portfolio_value * self.params["position"]["max_position_pct"]
-        return min(position_size, max_size)
+        max_size_usd = portfolio_value * self.params["position"]["max_position_pct"]
+        max_size_qty = max_size_usd / entry_price
+        return min(position_size, max_size_qty)
 
     def check_all(
         self,
@@ -173,12 +260,14 @@ class RiskManager:
         portfolio_value: float,
         current_positions: int,
         current_volatility: float = 0.0,
+        monthly_pnl: float = 0.0,
     ) -> tuple[bool, str]:
         """주문 실행 전 모든 리스크 조건을 순서대로 체크.
 
         체크 순서:
         1. Circuit Breaker 발동 여부
         2. 일일 손실 한도 초과
+        2.5. 월간 손실 한도 초과
         3. 동시 포지션 수 초과
         4. 변동성 체크
 
@@ -187,6 +276,7 @@ class RiskManager:
             portfolio_value: 총 포트폴리오 가치.
             current_positions: 현재 보유 포지션 수.
             current_volatility: 현재 1시간 변동성.
+            monthly_pnl: 당월 누적 손익.
 
         Returns:
             (통과 여부, 사유) 튜플.
@@ -197,11 +287,19 @@ class RiskManager:
             return False, "Circuit Breaker 발동 상태"
 
         # 2. 일일 손실 한도
-        if daily_pnl < 0:
+        if daily_pnl < 0 and portfolio_value > 0:
             loss_pct = abs(daily_pnl) / portfolio_value
             if loss_pct > self.params["loss_limits"]["daily_loss_limit_pct"]:
                 logger.warning(f"일일 손실 한도 초과: {loss_pct:.2%}")
                 return False, f"일일 손실 한도 초과 ({loss_pct:.2%})"
+
+        # 2.5. 월간 손실 한도
+        if monthly_pnl < 0 and portfolio_value > 0:
+            monthly_loss_pct = abs(monthly_pnl) / portfolio_value
+            monthly_limit = self.params["loss_limits"]["monthly_loss_limit_pct"]
+            if monthly_loss_pct > monthly_limit:
+                logger.warning(f"월간 손실 한도 초과: {monthly_loss_pct:.2%}")
+                return False, f"월간 손실 한도 초과 ({monthly_loss_pct:.2%})"
 
         # 3. 동시 포지션 수
         max_positions = self.params["position"]["max_concurrent_positions"]
