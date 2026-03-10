@@ -438,7 +438,7 @@ def run_backtest(strategy_name: str) -> None:
         entries=(signal_series == 1),
         exits=(signal_series == -1),
         fees=0.0004,
-        slippage=0.001,
+        slippage=0.002,
         init_cash=1_000_000,
         size=max_position_pct,
         size_type="targetpercent",

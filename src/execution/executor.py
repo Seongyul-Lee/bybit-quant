@@ -110,7 +110,15 @@ class OrderExecutor:
         try:
             params = {}
             if stop_loss is not None:
-                params["stopLoss"] = {"triggerPrice": stop_loss}
+                # SL 트리거를 0.1% 앞당겨 설정 (stop market 슬리피지 보상)
+                # long: SL가보다 약간 위에서 트리거 → 체결가가 SL가에 근접
+                # short: SL가보다 약간 아래에서 트리거
+                sl_buffer = stop_loss * 0.001
+                if side == "buy":  # short 포지션의 SL (가격 상승 시 손절)
+                    sl_trigger = stop_loss - sl_buffer
+                else:  # long 포지션의 SL (가격 하락 시 손절)
+                    sl_trigger = stop_loss + sl_buffer
+                params["stopLoss"] = {"triggerPrice": sl_trigger}
             if take_profit is not None:
                 params["takeProfit"] = {"triggerPrice": take_profit}
 

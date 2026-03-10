@@ -93,7 +93,7 @@ def run(
         entries=(signal_series == 1),
         exits=(signal_series == -1),
         fees=fee_rate,
-        slippage=0.001,
+        slippage=0.002,
         init_cash=1_000_000,
         size=max_position_pct,
         size_type="percent",
