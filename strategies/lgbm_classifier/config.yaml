@@ -6,17 +6,19 @@ strategy:
 params:
   model_path: strategies/lgbm_classifier/models/latest.txt
   feature_names_path: strategies/lgbm_classifier/models/feature_names.json
-  confidence_threshold: 0.40
-  upper_barrier_multiplier: 2.5   # 원복: 중립 24.8%가 노이즈 필터 역할
-  lower_barrier_multiplier: 2.5   # 원복: 대칭 배리어 유지
-  max_holding_period: 24
+  confidence_threshold: 0.48
+  upper_barrier_multiplier: 1.8
+  lower_barrier_multiplier: 1.8
+  max_holding_period: 16
+  ensemble_folds: [10, 11, 13]
+  models_dir: strategies/lgbm_classifier/models
 
 execution:
   order_type: limit
   limit_offset: 0.001
-  fee_rate: 0.00055  # Bybit Taker 0.055% (보수적 기준)
+  fee_rate: 0.00055
 
 risk:
   max_position_pct: 0.05
-  stop_loss_pct: 0.018            # 1.8% (2.5×ATR ≈ 1.81%에 정합, 대칭)
-  take_profit_pct: 0.018          # 1.8% (대칭)
+  stop_loss_pct: 0.015
+  take_profit_pct: 0.015

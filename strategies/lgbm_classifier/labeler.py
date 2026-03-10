@@ -1,7 +1,7 @@
 """Triple Barrier 라벨링 모듈.
 
-ATR 기반 상/하 배리어와 최대 보유 기간으로 3클래스 라벨을 생성한다.
-라벨: 1(매수), 0(중립), -1(매도).
+ATR 기반 상/하 배리어와 최대 보유 기간으로 2클래스 라벨을 생성한다.
+라벨: 1(매수), 0(비매수).
 """
 
 import numpy as np
@@ -9,11 +9,11 @@ import pandas as pd
 
 
 class TripleBarrierLabeler:
-    """Triple Barrier 방식으로 3클래스 라벨을 생성.
+    """Triple Barrier 방식으로 2클래스 라벨을 생성.
 
     각 봉에서 ATR 기반 상한/하한 배리어를 설정하고,
     max_holding_period 내에 어느 배리어를 먼저 터치하는지에 따라
-    라벨을 결정한다.
+    라벨을 결정한다. 상단 배리어 터치 → 1(매수), 그 외 → 0(비매수).
 
     Attributes:
         upper_multiplier: 상단 배리어 ATR 배수.
@@ -46,7 +46,7 @@ class TripleBarrierLabeler:
                 없으면 자체 계산한다.
 
         Returns:
-            라벨 시리즈 (1=매수, -1=매도, 0=중립, NaN=라벨 불가).
+            라벨 시리즈 (1=매수, 0=비매수, NaN=라벨 불가).
             마지막 max_holding_period 봉은 NaN.
         """
         close = df["close"].values
@@ -68,24 +68,24 @@ class TripleBarrierLabeler:
             upper_barrier = close[i] + self.upper_multiplier * atr[i]
             lower_barrier = close[i] - self.lower_multiplier * atr[i]
 
-            label = 0  # 기본: 중립 (어느 배리어도 미터치)
+            label = 0  # 기본: 비매수 (하단 배리어 터치 또는 타임아웃)
 
             for j in range(i + 1, i + 1 + self.max_holding_period):
                 hit_upper = high[j] >= upper_barrier
                 hit_lower = low[j] <= lower_barrier
 
                 if hit_upper and hit_lower:
-                    # 동시 터치: open 기준으로 판단
+                    # 동시 터치: 상단이 가까우면 매수, 하단이 가까우면 비매수
                     if abs(high[j] - close[i]) <= abs(low[j] - close[i]):
                         label = 1
                     else:
-                        label = -1
+                        label = 0
                     break
                 elif hit_upper:
                     label = 1
                     break
                 elif hit_lower:
-                    label = -1
+                    label = 0
                     break
 
             labels[i] = label

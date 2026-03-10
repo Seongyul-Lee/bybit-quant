@@ -25,24 +25,23 @@ class ModelEvaluator:
         """ML 분류 성능 지표 계산.
 
         Args:
-            y_true: 실제 라벨 (0, 1, 2).
-            y_pred: 예측 라벨 (0, 1, 2).
-            y_proba: 예측 확률 (n_samples, 3).
+            y_true: 실제 라벨 (0, 1).
+            y_pred: 예측 라벨 (0, 1).
+            y_proba: 예측 확률 (n_samples,) — positive class(1)의 확률.
 
         Returns:
-            {"f1_macro", "auc_roc_ovr"} 딕셔너리.
+            {"f1_binary", "auc_roc"} 딕셔너리.
         """
-        f1 = f1_score(y_true, y_pred, average="macro")
+        f1 = f1_score(y_true, y_pred, average="binary", pos_label=1)
 
-        # AUC-ROC OvR (클래스가 2개 이상이어야 계산 가능)
         try:
-            auc = roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
+            auc = roc_auc_score(y_true, y_proba)
         except ValueError:
             auc = 0.0
 
         return {
-            "f1_macro": float(f1),
-            "auc_roc_ovr": float(auc),
+            "f1_binary": float(f1),
+            "auc_roc": float(auc),
         }
 
     @staticmethod

@@ -46,11 +46,11 @@ class TestTripleBarrierLabeler:
         assert len(labels) == len(sample_ohlcv)
 
     def test_label_values(self, sample_ohlcv: pd.DataFrame) -> None:
-        """라벨 값이 -1, 0, 1, NaN 중 하나인지 확인."""
+        """라벨 값이 0, 1, NaN 중 하나인지 확인."""
         labeler = TripleBarrierLabeler()
         labels = labeler.generate_labels(sample_ohlcv)
         valid = labels.dropna()
-        assert set(valid.unique()).issubset({-1, 0, 1})
+        assert set(valid.unique()).issubset({0, 1})
 
     def test_last_bars_are_nan(self, sample_ohlcv: pd.DataFrame) -> None:
         """마지막 max_holding_period 봉이 NaN인지 확인."""
@@ -91,8 +91,8 @@ class TestTripleBarrierLabeler:
         buy_ratio = (valid == 1).sum() / len(valid)
         assert buy_ratio > 0.5, f"상승 추세에서 매수 비율이 너무 낮음: {buy_ratio:.2f}"
 
-    def test_clear_downtrend_labels_sell(self) -> None:
-        """명확한 하락 추세에서 매도(-1) 라벨이 생성되는지 확인."""
+    def test_clear_downtrend_labels_non_buy(self) -> None:
+        """명확한 하락 추세에서 비매수(0) 라벨이 생성되는지 확인."""
         n = 100
         close = np.arange(2000, 2000 - n * 10, -10, dtype=float)
         high = close + 5
@@ -112,8 +112,8 @@ class TestTripleBarrierLabeler:
         labeler = TripleBarrierLabeler(upper_multiplier=2.0, lower_multiplier=1.0)
         labels = labeler.generate_labels(df)
         valid = labels.dropna()
-        sell_ratio = (valid == -1).sum() / len(valid)
-        assert sell_ratio > 0.5, f"하락 추세에서 매도 비율이 너무 낮음: {sell_ratio:.2f}"
+        non_buy_ratio = (valid == 0).sum() / len(valid)
+        assert non_buy_ratio > 0.5, f"하락 추세에서 비매수 비율이 너무 낮음: {non_buy_ratio:.2f}"
 
     def test_custom_parameters(self, sample_ohlcv: pd.DataFrame) -> None:
         """커스텀 파라미터가 정상 적용되는지 확인."""

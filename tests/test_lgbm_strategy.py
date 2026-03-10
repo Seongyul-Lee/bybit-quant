@@ -1,6 +1,7 @@
 """LGBMClassifierStrategy generate_signal 인터페이스 검증 테스트.
 
 mock 모델을 사용하여 실제 LightGBM 학습 없이 전략 인터페이스를 검증한다.
+2클래스 이진 분류 (롱 전용): 1(매수), 0(비매수).
 """
 
 import json
@@ -75,42 +76,42 @@ class TestLGBMClassifierStrategy:
     ) -> None:
         """generate_signal이 int를 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
-        # mock 모델이 중립을 반환하도록 설정
-        strategy.model.predict.return_value = np.array([[0.1, 0.8, 0.1]])
+        # mock 모델이 낮은 매수 확률을 반환 → 비매수
+        strategy.model.predict.return_value = np.array([0.3])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert isinstance(signal, (int, np.integer))
-        assert signal in {-1, 0, 1}
+        assert signal in {0, 1}
 
     def test_generate_signal_buy(
         self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
     ) -> None:
         """높은 매수 확률이면 1을 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
-        # p_up(class 2) = 0.7 → 매수
-        strategy.model.predict.return_value = np.array([[0.1, 0.2, 0.7]])
+        # 매수 확률 0.7 >= threshold 0.5 → 매수
+        strategy.model.predict.return_value = np.array([0.7])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert signal == 1
 
-    def test_generate_signal_sell(
+    def test_generate_signal_non_buy(
         self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
     ) -> None:
-        """높은 매도 확률이면 -1을 반환하는지 확인."""
+        """낮은 매수 확률이면 0을 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
-        # p_down(class 0) = 0.7 → 매도
-        strategy.model.predict.return_value = np.array([[0.7, 0.2, 0.1]])
+        # 매수 확률 0.3 < threshold 0.5 → 비매수
+        strategy.model.predict.return_value = np.array([0.3])
 
         signal = strategy.generate_signal(sample_ohlcv)
-        assert signal == -1
+        assert signal == 0
 
     def test_generate_signal_neutral_below_threshold(
         self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
     ) -> None:
-        """모든 확률이 threshold 미만이면 0을 반환하는지 확인."""
+        """확률이 threshold 미만이면 0을 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files, confidence=0.5)
-        # 최대 확률 = 0.4 < 0.5 → 중립
-        strategy.model.predict.return_value = np.array([[0.3, 0.4, 0.3]])
+        # 매수 확률 0.4 < 0.5 → 비매수
+        strategy.model.predict.return_value = np.array([0.4])
 
         signal = strategy.generate_signal(sample_ohlcv)
         assert signal == 0
@@ -121,16 +122,16 @@ class TestLGBMClassifierStrategy:
         """generate_signals_vectorized가 Series를 반환하는지 확인."""
         strategy = _create_mock_strategy(mock_model_files)
 
-        # predict_proba가 입력 크기에 맞게 동적 반환
-        def dynamic_proba(X):
-            return np.tile([0.1, 0.8, 0.1], (len(X), 1))
+        # binary predict: (n,) shape — 매수 확률
+        def dynamic_predict(X):
+            return np.full(len(X), 0.3)  # 모두 비매수
 
-        strategy.model.predict.side_effect = dynamic_proba
+        strategy.model.predict.side_effect = dynamic_predict
 
         signals = strategy.generate_signals_vectorized(sample_ohlcv)
         assert isinstance(signals, pd.Series)
         assert len(signals) == len(sample_ohlcv)
-        assert set(signals.unique()).issubset({-1, 0, 1})
+        assert set(signals.unique()).issubset({0, 1})
 
     def test_generate_signals_vectorized_confidence_filter(
         self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
@@ -138,10 +139,10 @@ class TestLGBMClassifierStrategy:
         """벡터화 신호에서 confidence 필터가 적용되는지 확인."""
         strategy = _create_mock_strategy(mock_model_files, confidence=0.6)
 
-        def dynamic_proba(X):
-            return np.tile([0.3, 0.4, 0.3], (len(X), 1))
+        def dynamic_predict(X):
+            return np.full(len(X), 0.4)  # 모두 0.4 < 0.6
 
-        strategy.model.predict.side_effect = dynamic_proba
+        strategy.model.predict.side_effect = dynamic_predict
 
         signals = strategy.generate_signals_vectorized(sample_ohlcv)
         assert (signals == 0).all()
@@ -161,16 +162,15 @@ class TestLGBMClassifierStrategy:
     def test_vectorized_matches_sequential(
         self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
     ) -> None:
-        """Defect #7: generate_signal() 순차 호출과 generate_signals_vectorized() 결과가 일치하는지 검증.
+        """generate_signal() 순차 호출과 generate_signals_vectorized() 결과가 일치하는지 검증.
 
         warmup 구간(처음 200봉) 이후 구간에서 동일한 신호를 반환해야 한다.
         """
         strategy = _create_mock_strategy(mock_model_files, confidence=0.5)
 
-        # mock 모델: 피처 값 기반으로 결정론적 결과를 반환하도록 설정
-        # 첫 번째 피처의 NaN 여부와 합계로 분류를 결정
+        # mock 모델: 피처 값 기반으로 결정론적 결과를 반환
         def deterministic_predict(X):
-            """피처 합계 기반으로 결정론적 확률 반환."""
+            """피처 합계 기반으로 결정론적 매수 확률 반환."""
             if isinstance(X, pd.DataFrame):
                 X_arr = X.values
             else:
@@ -179,16 +179,14 @@ class TestLGBMClassifierStrategy:
             results = []
             for row in X_arr:
                 if np.any(np.isnan(row)):
-                    results.append([0.1, 0.8, 0.1])  # 중립
+                    results.append(0.2)  # 비매수
                 else:
                     s = np.sum(row)
                     # 합계를 기반으로 결정론적 확률 생성
-                    if s % 3 < 1:
-                        results.append([0.7, 0.2, 0.1])  # 매도
-                    elif s % 3 < 2:
-                        results.append([0.1, 0.8, 0.1])  # 중립
+                    if s % 2 < 1:
+                        results.append(0.7)  # 매수
                     else:
-                        results.append([0.1, 0.2, 0.7])  # 매수
+                        results.append(0.3)  # 비매수
             return np.array(results)
 
         strategy.model.predict.side_effect = deterministic_predict

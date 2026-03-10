@@ -23,7 +23,6 @@ def run(
     strategy_name: str,
     symbol: str | None = None,
     timeframe: str | None = None,
-    allow_short: bool = False,
 ) -> None:
     """백테스트 실행.
 
@@ -31,7 +30,6 @@ def run(
         strategy_name: 전략 폴더명 (예: "ma_crossover").
         symbol: 심볼 오버라이드 (None이면 config.yaml 기본값).
         timeframe: 타임프레임 오버라이드 (None이면 config.yaml 기본값).
-        allow_short: 매도 신호를 숏 포지션 entry로 활용할지 여부.
     """
     import vectorbt as vbt
     from src.analytics.reporter import Reporter
@@ -91,7 +89,7 @@ def run(
     portfolio_kwargs = dict(
         close=df["close"],
         entries=(signal_series == 1),
-        exits=(signal_series == -1),
+        exits=pd.Series(False, index=signal_series.index),  # SL/TP에만 의존
         fees=fee_rate,
         slippage=0.002,
         init_cash=1_000_000,
@@ -100,11 +98,6 @@ def run(
         sl_stop=sl_stop,
         tp_stop=tp_stop,
     )
-    if allow_short:
-        portfolio_kwargs["short_entries"] = (signal_series == -1)
-        portfolio_kwargs["short_exits"] = (signal_series == 1)
-        portfolio_kwargs["upon_opposite_entry"] = "close"
-        logger.info("숏 포지션 활성화: 매도 신호를 숏 entry로 사용")
 
     portfolio = vbt.Portfolio.from_signals(**portfolio_kwargs)
 
@@ -238,11 +231,9 @@ def main() -> None:
     parser.add_argument("--strategy", type=str, required=True, help="전략 이름")
     parser.add_argument("--symbol", type=str, default=None, help="심볼 (기본: config.yaml)")
     parser.add_argument("--timeframe", type=str, default=None, help="타임프레임 (기본: config.yaml)")
-    parser.add_argument("--allow-short", action="store_true", help="매도 신호를 숏 포지션 entry로 활용")
-
     args = parser.parse_args()
     load_dotenv("config/.env")
-    run(args.strategy, args.symbol, args.timeframe, allow_short=args.allow_short)
+    run(args.strategy, args.symbol, args.timeframe)
 
 
 if __name__ == "__main__":
