@@ -7,8 +7,8 @@ params:
   model_path: strategies/lgbm_classifier/models/latest.txt
   feature_names_path: strategies/lgbm_classifier/models/feature_names.json
   confidence_threshold: 0.40
-  upper_barrier_multiplier: 2.5
-  lower_barrier_multiplier: 2.5
+  upper_barrier_multiplier: 2.5   # 원복: 중립 24.8%가 노이즈 필터 역할
+  lower_barrier_multiplier: 2.5   # 원복: 대칭 배리어 유지
   max_holding_period: 24
 
 execution:
@@ -18,5 +18,5 @@ execution:
 
 risk:
   max_position_pct: 0.05
-  stop_loss_pct: 0.02
-  take_profit_pct: 0.04
+  stop_loss_pct: 0.018            # 1.8% (2.5×ATR ≈ 1.81%에 정합, 대칭)
+  take_profit_pct: 0.018          # 1.8% (대칭)
