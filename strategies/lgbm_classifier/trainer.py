@@ -169,12 +169,12 @@ class WalkForwardTrainer:
         def objective(trial: optuna.Trial) -> float:
             params = {
                 **self.FIXED_PARAMS,
-                "num_leaves": trial.suggest_int("num_leaves", 20, 63),
-                "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
+                "num_leaves": trial.suggest_int("num_leaves", 7, 31),
+                "min_child_samples": trial.suggest_int("min_child_samples", 50, 200),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-                "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 0.01, 2.0, log=True),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.3, 0.6),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.5, 5.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 10.0, log=True),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 0.8),
                 "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.8),
             }
 
@@ -286,13 +286,13 @@ class WalkForwardTrainer:
         else:
             best_params = {
                 **self.FIXED_PARAMS,
-                "num_leaves": 23,
-                "min_child_samples": 100,
+                "num_leaves": 15,              # H-1: 62→15 (과적합 억제)
+                "min_child_samples": 100,      # H-3: 44→100 (leaf 분할 제약)
                 "learning_rate": 0.05,
-                "reg_alpha": 1.0,
-                "reg_lambda": 1.0,
-                "feature_fraction": 0.6,
-                "bagging_fraction": 0.6,
+                "reg_alpha": 1.5,              # L1 정규화 유지
+                "reg_lambda": 2.0,             # H-2: 0.012→2.0 (L2 정규화 활성화)
+                "feature_fraction": 0.6,       # H-4: 0.33→0.6 (피처 다양성)
+                "bagging_fraction": 0.7,       # 0.52→0.7
             }
 
         # 모든 fold에서 학습
