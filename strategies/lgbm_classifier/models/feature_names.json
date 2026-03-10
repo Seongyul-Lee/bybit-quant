@@ -14,5 +14,7 @@
   "hour_sin",
   "hour_cos",
   "rsi_14_1d",
-  "ma_50_1d_ratio"
+  "ma_50_1d_ratio",
+  "vol_ratio_7_30",
+  "return_skew_20"
 ]

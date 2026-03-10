@@ -1,11 +1,13 @@
 """LightGBM 전략용 피처 엔지니어링 모듈.
 
-약 50개 피처를 계산한다:
+약 65개 피처를 계산한다:
 - 기술적 지표 (MA, RSI, MACD, BB, ATR, ADX, Stochastic, OBV)
 - 가격 파생 (수익률, 로그수익률, 변동폭)
 - 거래량 파생 (변화율, 비율)
+- 변동성 구조 (ATR 비율, skewness, kurtosis, Parkinson)
+- 거래량 미세구조 (VWAP, 가격-거래량 상관)
 - 시간 피처 (cyclical encoding)
-- 멀티타임프레임 (4h, 1d resample)
+- 멀티타임프레임 (4h, 1d resample — RSI, MA, ATR, ADX, BB)
 """
 
 import numpy as np
@@ -45,6 +47,8 @@ class FeatureEngine:
         df = self._add_technical_indicators(df)
         df = self._add_price_features(df)
         df = self._add_volume_features(df)
+        df = self._add_volatility_structure_features(df)
+        df = self._add_volume_microstructure_features(df)
         df = self._add_time_features(df)
         df = self._add_multitimeframe_features(df)
 
@@ -90,6 +94,8 @@ class FeatureEngine:
             "hour_sin", "hour_cos",
             # 멀티타임프레임 (2개)
             "rsi_14_1d", "ma_50_1d_ratio",
+            # 변동성 구조 (2개)
+            "vol_ratio_7_30", "return_skew_20",
         ]
         return [f for f in selected if f in self._feature_names]
 
@@ -204,6 +210,53 @@ class FeatureEngine:
 
         return df
 
+    # ── 변동성 구조 피처 ────────────────────────────────────
+
+    def _add_volatility_structure_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """ATR 비율, 수익률 skewness/kurtosis, Parkinson 변동성 등 계산."""
+        # ATR(7) / ATR(30) — 변동성 확장/축소
+        atr_7 = self._compute_atr_series(df, 7)
+        atr_30 = self._compute_atr_series(df, 30)
+        df["vol_ratio_7_30"] = atr_7 / atr_30.replace(0, np.nan)
+
+        # 수익률 skewness / kurtosis (rolling 20봉)
+        ret = df["close"].pct_change()
+        df["return_skew_20"] = ret.rolling(20).skew()
+        df["return_kurt_20"] = ret.rolling(20).kurt()
+
+        # Parkinson volatility (high-low 기반, rolling 20봉)
+        log_hl = np.log(df["high"] / df["low"].replace(0, np.nan))
+        df["parkinson_vol_20"] = np.sqrt(
+            (log_hl ** 2).rolling(20).mean() / (4 * np.log(2))
+        )
+
+        # 상단/하단 그림자 비율 (매수/매도 압력 프록시)
+        atr = self._get_or_compute_atr(df).replace(0, np.nan)
+        df["upper_shadow_ratio"] = (df["high"] - df[["close", "open"]].max(axis=1)) / atr
+        df["lower_shadow_ratio"] = (df[["close", "open"]].min(axis=1) - df["low"]) / atr
+
+        return df
+
+    # ── 거래량 미세구조 피처 ──────────────────────────────
+
+    def _add_volume_microstructure_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """VWAP 편차, 거래량 skewness, 가격-거래량 상관관계 계산."""
+        # VWAP(20) 대비 현재가 편차 (ATR 정규화)
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        cumvol = df["volume"].rolling(20).sum().replace(0, np.nan)
+        vwap = (typical_price * df["volume"]).rolling(20).sum() / cumvol
+        atr = self._get_or_compute_atr(df).replace(0, np.nan)
+        df["vwap_deviation"] = (df["close"] - vwap) / atr
+
+        # 거래량 skewness (rolling 20봉)
+        df["volume_skew_20"] = df["volume"].rolling(20).skew()
+
+        # 가격-거래량 상관관계 (rolling 20봉)
+        ret = df["close"].pct_change()
+        df["price_volume_corr_20"] = ret.rolling(20).corr(df["volume"])
+
+        return df
+
     # ── 시간 피처 ────────────────────────────────────────────
 
     def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -232,10 +285,13 @@ class FeatureEngine:
         if "timestamp" not in df.columns:
             return df
 
-        df_ts = df.set_index(pd.to_datetime(df["timestamp"]))
+        ts_index = pd.to_datetime(df["timestamp"])
+        df_ts = df.set_index(ts_index)
+        ohlcv_cols = df[["open", "high", "low", "close", "volume"]].copy()
+        ohlcv_cols.index = ts_index
 
         for tf_label, rule in [("4h", "4h"), ("1d", "1D")]:
-            ohlcv_resampled = df_ts.resample(rule, label="right", closed="right").agg({
+            ohlcv_resampled = ohlcv_cols.resample(rule, label="right", closed="right").agg({
                 "open": "first",
                 "high": "max",
                 "low": "min",
@@ -261,6 +317,27 @@ class FeatureEngine:
             atr = self._compute_atr_series(ohlcv_resampled, 14)
             atr = atr.reindex(df_ts.index, method="ffill")
             df[f"atr_14_{tf_label}"] = atr.values
+
+            # ADX
+            adx = self._compute_adx(ohlcv_resampled, 14)
+            adx = adx.reindex(df_ts.index, method="ffill")
+            df[f"adx_14_{tf_label}"] = adx.values
+
+            # BB position
+            bb_mid = ohlcv_resampled["close"].rolling(20).mean()
+            bb_std = ohlcv_resampled["close"].rolling(20).std()
+            bb_upper = bb_mid + 2 * bb_std
+            bb_lower = bb_mid - 2 * bb_std
+            bb_range = (bb_upper - bb_lower).replace(0, np.nan)
+            bb_pos = (ohlcv_resampled["close"] - bb_lower) / bb_range
+            bb_pos = bb_pos.fillna(0.5)
+            bb_pos = bb_pos.reindex(df_ts.index, method="ffill")
+            df[f"bb_position_{tf_label}"] = bb_pos.values
+
+        # ATR 비율: 1h ATR / 1d ATR (크로스타임프레임 변동성 비교)
+        if "atr_14_1d" in df.columns:
+            atr_1h = self._get_or_compute_atr(df)
+            df["atr_ratio_1h_1d"] = atr_1h / df["atr_14_1d"].replace(0, np.nan)
 
         return df
 

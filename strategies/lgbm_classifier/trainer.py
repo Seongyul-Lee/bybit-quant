@@ -291,7 +291,7 @@ class WalkForwardTrainer:
                 "learning_rate": 0.02,
                 "reg_alpha": 3.0,
                 "reg_lambda": 5.0,
-                "feature_fraction": 0.6,
+                "feature_fraction": 0.5,
                 "bagging_fraction": 0.7,
                 "max_depth": 4,
                 "n_estimators": 200,
