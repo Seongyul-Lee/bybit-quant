@@ -3,10 +3,11 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
-from src.risk.manager import CircuitBreaker, RiskManager
+from src.risk.manager import CircuitBreaker, PnLTracker, RiskManager
 
 
 class TestCircuitBreaker(unittest.TestCase):
@@ -54,6 +55,75 @@ class TestCircuitBreaker(unittest.TestCase):
         self.cb.reset()
         self.assertFalse(self.cb.is_tripped)
         self.assertEqual(self.cb.consecutive_losses, 0)
+
+    def test_serialization(self) -> None:
+        """to_dict/from_dict 라운드트립 검증."""
+        self.cb.record_trade(-100)
+        self.cb.record_trade(-50)
+        data = self.cb.to_dict()
+
+        cb2 = CircuitBreaker()
+        cb2.from_dict(data)
+        self.assertEqual(cb2.consecutive_losses, 2)
+        self.assertFalse(cb2.is_tripped)
+
+        # 발동 상태에서도 복원
+        self.cb.trip("test")
+        data_tripped = self.cb.to_dict()
+        cb3 = CircuitBreaker()
+        cb3.from_dict(data_tripped)
+        self.assertTrue(cb3.is_tripped)
+        self.assertEqual(cb3.consecutive_losses, 2)
+
+
+class TestPnLTracker(unittest.TestCase):
+    """PnLTracker 테스트 클래스."""
+
+    def test_record_pnl_accumulates(self) -> None:
+        """PnL이 누적되는지 검증."""
+        tracker = PnLTracker()
+        tracker.record_pnl(100.0)
+        tracker.record_pnl(-50.0)
+        self.assertAlmostEqual(tracker.daily_pnl, 50.0)
+        self.assertAlmostEqual(tracker.monthly_pnl, 50.0)
+
+    def test_daily_reset_on_date_change(self) -> None:
+        """날짜 변경 시 일일 PnL 리셋 검증."""
+        tracker = PnLTracker()
+        tracker.record_pnl(100.0)
+        self.assertAlmostEqual(tracker.daily_pnl, 100.0)
+
+        # 어제 날짜로 강제 설정 후 새 기록
+        tracker._current_date = "2020-01-01"
+        tracker.record_pnl(50.0)
+        self.assertAlmostEqual(tracker.daily_pnl, 50.0)  # 리셋 후 50만 남음
+
+    def test_monthly_reset_on_month_change(self) -> None:
+        """월 변경 시 월간 PnL 리셋 검증."""
+        tracker = PnLTracker()
+        tracker.record_pnl(500.0)
+        self.assertAlmostEqual(tracker.monthly_pnl, 500.0)
+
+        # 이전 월로 강제 설정 후 새 기록
+        tracker._current_month = "2020-01"
+        tracker._current_date = "2020-01-31"
+        tracker.record_pnl(100.0)
+        self.assertAlmostEqual(tracker.monthly_pnl, 100.0)  # 리셋 후 100만 남음
+        self.assertAlmostEqual(tracker.daily_pnl, 100.0)  # 일일도 리셋
+
+    def test_serialization_roundtrip(self) -> None:
+        """to_dict/from_dict 라운드트립 검증."""
+        tracker = PnLTracker()
+        tracker.record_pnl(200.0)
+        tracker.record_pnl(-50.0)
+        data = tracker.to_dict()
+
+        tracker2 = PnLTracker()
+        tracker2.from_dict(data)
+        self.assertAlmostEqual(tracker2.daily_pnl, 150.0)
+        self.assertAlmostEqual(tracker2.monthly_pnl, 150.0)
+        self.assertEqual(tracker2._current_date, tracker._current_date)
+        self.assertEqual(tracker2._current_month, tracker._current_month)
 
 
 class TestRiskManager(unittest.TestCase):
@@ -151,6 +221,90 @@ class TestRiskManager(unittest.TestCase):
         sl, tp = self.rm.get_stop_take_profit(entry_price=40000, side="short")
         self.assertAlmostEqual(sl, 40000 * 1.02)
         self.assertAlmostEqual(tp, 40000 * 0.96)
+
+    def test_check_all_monthly_loss(self) -> None:
+        """월간 손실 한도 초과 시 거부 검증."""
+        ok, reason = self.rm.check_all(
+            daily_pnl=0,
+            portfolio_value=100_000,
+            current_positions=0,
+            monthly_pnl=-15_000,  # 15% > 10% 한도
+        )
+        self.assertFalse(ok)
+        self.assertIn("월간 손실 한도", reason)
+
+    def test_check_all_monthly_loss_within_limit(self) -> None:
+        """월간 손실이 한도 이내일 때 통과 검증."""
+        ok, reason = self.rm.check_all(
+            daily_pnl=0,
+            portfolio_value=100_000,
+            current_positions=0,
+            monthly_pnl=-5_000,  # 5% < 10% 한도
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "OK")
+
+
+    def test_atr_position_size_max_cap_in_quantity(self) -> None:
+        """ATR 포지션 사이즈가 max_position_pct 상한을 수량 단위로 적용하는지 검증.
+
+        예시: portfolio $10,000, ATR 300, BTC $90,000
+        dollar_risk = 10000 * 0.01 = 100
+        position_size = 100 / 300 = 0.333 BTC
+        max_size_usd = 10000 * 0.05 = 500
+        max_size_qty = 500 / 90000 = 0.00556 BTC
+        결과: min(0.333, 0.00556) = 0.00556 → 캡 적용됨
+        """
+        size = self.rm.calculate_atr_position_size(
+            portfolio_value=10_000,
+            atr=300,
+            entry_price=90_000,
+        )
+        max_size_qty = 10_000 * 0.05 / 90_000  # 0.00556 BTC
+        self.assertAlmostEqual(size, max_size_qty, places=6)
+        # 캡이 없었다면 0.333 BTC가 되므로, 캡이 적용되었는지 확인
+        uncapped = 10_000 * 0.01 / 300  # 0.333 BTC
+        self.assertLess(size, uncapped)
+
+    def test_atr_position_size_below_cap(self) -> None:
+        """ATR 포지션 사이즈가 캡 이하일 때 그대로 반환되는지 검증."""
+        # portfolio $100,000, ATR 5000, entry_price $50,000
+        # dollar_risk = 100000 * 0.01 = 1000
+        # position_size = 1000 / 5000 = 0.2
+        # max_size_qty = 100000 * 0.05 / 50000 = 0.1
+        # min(0.2, 0.1) = 0.1 → 캡 적용
+        size = self.rm.calculate_atr_position_size(
+            portfolio_value=100_000,
+            atr=5000,
+            entry_price=50_000,
+        )
+        expected = min(100_000 * 0.01 / 5000, 100_000 * 0.05 / 50_000)
+        self.assertAlmostEqual(size, expected, places=6)
+
+    def test_atr_position_size_entry_price_zero(self) -> None:
+        """entry_price가 0 이하일 때 0.0 반환 검증."""
+        size = self.rm.calculate_atr_position_size(
+            portfolio_value=10_000,
+            atr=300,
+            entry_price=0,
+        )
+        self.assertEqual(size, 0.0)
+
+        size_neg = self.rm.calculate_atr_position_size(
+            portfolio_value=10_000,
+            atr=300,
+            entry_price=-100,
+        )
+        self.assertEqual(size_neg, 0.0)
+
+    def test_atr_position_size_atr_zero(self) -> None:
+        """ATR이 0 이하일 때 0.0 반환 검증."""
+        size = self.rm.calculate_atr_position_size(
+            portfolio_value=10_000,
+            atr=0,
+            entry_price=90_000,
+        )
+        self.assertEqual(size, 0.0)
 
 
 if __name__ == "__main__":

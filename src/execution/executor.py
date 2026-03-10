@@ -50,7 +50,25 @@ class OrderExecutor:
         """
         self.exchange = exchange
         self.pending_orders: dict[str, dict] = {}
+        self._cumulative_pnl = self._load_cumulative_pnl()
         logger.info("OrderExecutor 초기화 완료")
+
+    @staticmethod
+    def _load_cumulative_pnl() -> float:
+        """trade_log.csv 마지막 행에서 cumulative_pnl 값을 로드.
+
+        Returns:
+            마지막 기록된 cumulative_pnl. 파일 없거나 비어있으면 0.0.
+        """
+        if not os.path.exists(TRADE_LOG_PATH):
+            return 0.0
+        try:
+            df = pd.read_csv(TRADE_LOG_PATH)
+            if df.empty or "cumulative_pnl" not in df.columns:
+                return 0.0
+            return float(df["cumulative_pnl"].iloc[-1])
+        except Exception:
+            return 0.0
 
     def execute(
         self,
@@ -92,7 +110,15 @@ class OrderExecutor:
         try:
             params = {}
             if stop_loss is not None:
-                params["stopLoss"] = {"triggerPrice": stop_loss}
+                # SL 트리거를 0.1% 앞당겨 설정 (stop market 슬리피지 보상)
+                # long: SL가보다 약간 위에서 트리거 → 체결가가 SL가에 근접
+                # short: SL가보다 약간 아래에서 트리거
+                sl_buffer = stop_loss * 0.001
+                if side == "buy":  # short 포지션의 SL (가격 상승 시 손절)
+                    sl_trigger = stop_loss - sl_buffer
+                else:  # long 포지션의 SL (가격 하락 시 손절)
+                    sl_trigger = stop_loss + sl_buffer
+                params["stopLoss"] = {"triggerPrice": sl_trigger}
             if take_profit is not None:
                 params["takeProfit"] = {"triggerPrice": take_profit}
 
@@ -197,7 +223,7 @@ class OrderExecutor:
             "amount": order.get("amount", 0),
             "fee": order.get("fee", {}).get("cost", 0) if order.get("fee") else 0,
             "pnl": 0,
-            "cumulative_pnl": 0,
+            "cumulative_pnl": self._cumulative_pnl,
             "signal_score": signal_score,
             "notes": "",
         }
@@ -210,8 +236,82 @@ class OrderExecutor:
             TRADE_LOG_PATH, mode="a", header=write_header, index=False
         )
 
+    def close_position(
+        self,
+        symbol: str,
+        position: dict,
+        strategy_name: str = "",
+    ) -> Optional[dict]:
+        """기존 포지션을 시장가로 청산.
+
+        Args:
+            symbol: 거래 심볼.
+            position: 포지션 정보 딕셔너리 (side, size 포함).
+            strategy_name: 전략 이름 (기록용).
+
+        Returns:
+            거래소 주문 응답, 실패 시 None.
+        """
+        close_side = "sell" if position["side"] == "long" else "buy"
+        # 같은 방향의 기존 미체결 주문 취소 (멱등성 체크 충돌 방지)
+        for oid, order in list(self.pending_orders.items()):
+            if order["symbol"] == symbol and order["side"] == close_side:
+                self.cancel(oid, symbol)
+        return self.execute(
+            symbol=symbol,
+            side=close_side,
+            amount=position["size"],
+            order_type="market",
+            strategy_name=strategy_name,
+            signal_score=0,
+        )
+
+    def record_closed_pnl(
+        self,
+        symbol: str,
+        pnl: float,
+        strategy_name: str = "",
+        reason: str = "",
+    ) -> None:
+        """청산된 포지션의 PnL을 trade_log에 기록.
+
+        SL/TP 자동 청산이나 반전 청산의 PnL을 별도 행으로 기록한다.
+
+        Args:
+            symbol: 거래 심볼.
+            pnl: 실현 PnL.
+            strategy_name: 전략 이름.
+            reason: 청산 사유 (예: "SL/TP 자동 청산", "반전 청산").
+        """
+        self._cumulative_pnl += pnl
+
+        trade = {
+            "trade_id": str(uuid.uuid4())[:8],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "strategy": strategy_name,
+            "symbol": symbol,
+            "side": "close",
+            "order_type": "auto",
+            "price": 0,
+            "amount": 0,
+            "fee": 0,
+            "pnl": pnl,
+            "cumulative_pnl": self._cumulative_pnl,
+            "signal_score": 0,
+            "notes": reason,
+        }
+
+        os.makedirs(os.path.dirname(TRADE_LOG_PATH), exist_ok=True)
+        new_row = pd.DataFrame([trade])
+
+        write_header = not os.path.exists(TRADE_LOG_PATH)
+        new_row.to_csv(
+            TRADE_LOG_PATH, mode="a", header=write_header, index=False
+        )
+        logger.info(f"PnL 기록: {symbol} {pnl:+.4f} (누적: {self._cumulative_pnl:+.4f})")
+
     @staticmethod
-    def _save_state(positions: dict) -> None:
+    def _save_state(positions: dict, extra_state: Optional[dict] = None) -> None:
         """현재 상태를 Atomic Write로 JSON 파일에 저장.
 
         쓰다가 프로세스가 죽어도 파일이 깨지지 않도록
@@ -219,11 +319,14 @@ class OrderExecutor:
 
         Args:
             positions: 현재 포지션 딕셔너리.
+            extra_state: 추가 상태 (circuit_breaker, pnl_tracker 등).
         """
         state = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "positions": positions,
         }
+        if extra_state:
+            state.update(extra_state)
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, dir=os.path.dirname(STATE_PATH)

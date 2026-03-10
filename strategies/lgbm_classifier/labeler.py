@@ -23,15 +23,15 @@ class TripleBarrierLabeler:
 
     def __init__(
         self,
-        upper_multiplier: float = 2.0,
-        lower_multiplier: float = 1.0,
+        upper_multiplier: float = 1.5,
+        lower_multiplier: float = 1.5,
         max_holding_period: int = 24,
     ) -> None:
         """TripleBarrierLabeler 초기화.
 
         Args:
-            upper_multiplier: 상단 배리어 = close + upper_multiplier * ATR_14.
-            lower_multiplier: 하단 배리어 = close - lower_multiplier * ATR_14.
+            upper_multiplier: 상단 배리어 = close + upper_multiplier * ATR_14. 대칭 권장.
+            lower_multiplier: 하단 배리어 = close - lower_multiplier * ATR_14. 대칭 권장.
             max_holding_period: 배리어 미터치 시 최대 대기 봉 수.
         """
         self.upper_multiplier = upper_multiplier

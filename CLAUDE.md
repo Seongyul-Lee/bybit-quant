@@ -142,6 +142,39 @@ train_lgbm.py    → LightGBM 학습 CLI 스크립트
 - Fail-Safe 우선: 오류 발생 시 포지션 유지 대신 안전 종료
 - ML 전략 실거래 재학습은 live 루프 내에서 하지 않음 (train_lgbm.py 별도 실행)
 
+## 모델 버전 관리
+
+### 개요
+유의미한 모델은 **git 커밋 + 태그**로 보존한다.
+`data/`, `strategies/**/models/`는 git 추적 대상이며, 모델·데이터·코드가 함께 커밋되어 완전 재현이 가능하다.
+
+### 커밋 규칙
+좋은 백테스트 결과가 나오면 아래 파일을 함께 커밋한다:
+
+```
+data/raw/bybit/          → 모델 학습에 사용된 원본 OHLCV
+data/processed/          → 피처 엔지니어링 결과 (모델과 직결)
+strategies/**/models/    → 모델 파일 (latest.txt, *.json)
+strategies/**/config.yaml → threshold, barrier 등 하이퍼파라미터
+```
+
+### 태그 컨벤션
+```bash
+git tag -a model/lgbm/run17 -m "barrier=2.5x, th=0.40: +10.35%, sharpe 3.19, 373건"
+```
+- 형식: `model/{전략}/{run번호}`
+- 메시지: 핵심 설정과 지표 요약
+
+### 복원
+```bash
+git checkout tags/model/lgbm/run17 -- data/ strategies/lgbm_classifier/models/ strategies/lgbm_classifier/config.yaml
+```
+
+### 주의사항
+- raw 데이터 재수집 시 OHLCV 값이 미세하게 달라질 수 있음 → 재수집 전 반드시 커밋
+- Optuna 비결정성으로 동일 설정 재학습 시 다른 결과가 나올 수 있음 → 좋은 모델은 즉시 커밋
+- `strategies/**/models/*_backup/` 폴더는 git 제외 (임시 백업용)
+
 ## 리스크 파라미터 (config/risk_params.yaml)
 - 단일 포지션 최대 5%, 동시 최대 3개, 레버리지 3배
 - 일일 손실 3%, 월간 손실 10% 초과 시 거래 중단

@@ -120,23 +120,48 @@ class Reporter:
         logger.info(f"백테스트 결과 저장: {path}")
         return path
 
+    # 타임프레임별 연간 봉 수 매핑
+    PERIODS_PER_YEAR: dict[str, int] = {
+        "1m": 525_600,   # 365 * 24 * 60
+        "5m": 105_120,   # 365 * 24 * 12
+        "15m": 35_040,   # 365 * 24 * 4
+        "30m": 17_520,   # 365 * 24 * 2
+        "1h": 8_760,     # 365 * 24
+        "2h": 4_380,     # 365 * 12
+        "4h": 2_190,     # 365 * 6
+        "6h": 1_460,     # 365 * 4
+        "12h": 730,      # 365 * 2
+        "1d": 365,
+        "1w": 52,
+    }
+
     @staticmethod
-    def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> dict:
+    def calculate_metrics(
+        returns: pd.Series,
+        risk_free_rate: float = 0.0,
+        timeframe: str = "1d",
+        trade_stats: Optional[dict] = None,
+    ) -> dict:
         """수익률 시리즈에서 주요 성과 지표를 계산.
 
         Args:
-            returns: 일별 수익률 시리즈.
+            returns: 수익률 시리즈 (봉 단위).
             risk_free_rate: 무위험 수익률 (연간).
+            timeframe: 데이터 타임프레임 (연환산 계수 결정에 사용).
+            trade_stats: 거래 기반 지표 딕셔너리 (선택).
+                키: total_trades, win_rate, profit_factor.
+                제공 시 봉 기준 값 대신 거래 기반 값을 사용한다.
 
         Returns:
             성과 지표 딕셔너리 (total_return, sharpe_ratio, max_drawdown 등).
         """
+        periods_per_year = Reporter.PERIODS_PER_YEAR.get(timeframe, 252)
         total_return = float((1 + returns).prod() - 1)
 
-        # 샤프 비율 (연간화)
-        excess_returns = returns - risk_free_rate / 252
+        # 샤프 비율 (연간화 — 타임프레임 기반)
+        excess_returns = returns - risk_free_rate / periods_per_year
         sharpe_ratio = float(
-            np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+            np.sqrt(periods_per_year) * excess_returns.mean() / excess_returns.std()
         ) if excess_returns.std() > 0 else 0.0
 
         # MDD
@@ -145,13 +170,17 @@ class Reporter:
         drawdown = (cumulative - running_max) / running_max
         max_drawdown = float(drawdown.min())
 
-        # 승률
-        win_rate = float((returns > 0).mean()) if len(returns) > 0 else 0.0
-
-        # Profit Factor
-        gross_profit = float(returns[returns > 0].sum())
-        gross_loss = float(abs(returns[returns < 0].sum()))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        # 거래 기반 지표: trade_stats가 있으면 사용, 없으면 봉 기준 fallback
+        if trade_stats:
+            total_trades = trade_stats.get("total_trades", 0)
+            win_rate = trade_stats.get("win_rate", 0.0)
+            profit_factor = trade_stats.get("profit_factor", 0.0)
+        else:
+            total_trades = len(returns)
+            win_rate = float((returns > 0).mean()) if len(returns) > 0 else 0.0
+            gross_profit = float(returns[returns > 0].sum())
+            gross_loss = float(abs(returns[returns < 0].sum()))
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
         return {
             "total_return": total_return,
@@ -159,7 +188,7 @@ class Reporter:
             "max_drawdown": max_drawdown,
             "win_rate": win_rate,
             "profit_factor": profit_factor,
-            "total_trades": len(returns),
+            "total_trades": total_trades,
         }
 
     @staticmethod
