@@ -14,12 +14,12 @@ import pandas as pd
 import lightgbm as lgb
 import yaml
 
-from strategies.lgbm_classifier.features import FeatureEngine
+from strategies._common.features import FeatureEngine
 
 
 def load_config():
     """config.yaml에서 파라미터를 로드."""
-    with open("strategies/lgbm_classifier/config.yaml", "r", encoding="utf-8") as f:
+    with open("strategies/btc_1h_momentum/config.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
 
@@ -132,7 +132,7 @@ def run_oos_validation():
     POSITION_PCT = risk.get("max_position_pct", 0.05)
     FEE_PER_SIDE = config.get("execution", {}).get("fee_rate", 0.00055)
     ENSEMBLE_FOLDS = params.get("ensemble_folds", None)
-    MODELS_DIR = params.get("models_dir", "strategies/lgbm_classifier/models")
+    MODELS_DIR = params.get("models_dir", "strategies/btc_1h_momentum/models")
 
     # 모델 로드 (앙상블 또는 단일)
     if ENSEMBLE_FOLDS:
@@ -142,15 +142,15 @@ def run_oos_validation():
             models.append(lgb.Booster(model_file=path))
         print(f"앙상블 모델: {len(models)}개 fold ({ENSEMBLE_FOLDS})")
     else:
-        model = lgb.Booster(model_file="strategies/lgbm_classifier/models/latest.txt")
+        model = lgb.Booster(model_file="strategies/btc_1h_momentum/models/latest.txt")
         models = None
         print("단일 모델 (latest.txt)")
 
-    with open("strategies/lgbm_classifier/models/feature_names.json") as f:
+    with open("strategies/btc_1h_momentum/models/feature_names.json") as f:
         feature_names = json.load(f)
 
     # 학습 메타 로드
-    with open("strategies/lgbm_classifier/models/training_meta.json") as f:
+    with open("strategies/btc_1h_momentum/models/training_meta.json") as f:
         meta = json.load(f)
 
     # 앙상블일 때 PV 시작점 = 가장 최신 fold의 val_end

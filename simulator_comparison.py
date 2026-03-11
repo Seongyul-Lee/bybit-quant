@@ -13,7 +13,7 @@ import pandas as pd
 import lightgbm as lgb
 import yaml
 
-from strategies.lgbm_classifier.features import FeatureEngine
+from strategies._common.features import FeatureEngine
 
 
 def simulate_highlow(df_period, signals_period, sl_pct, tp_pct, max_hold,
@@ -175,7 +175,7 @@ def _summarize(trades, position_pct, fee_per_side):
 
 
 def main():
-    with open("strategies/lgbm_classifier/config.yaml", "r", encoding="utf-8") as f:
+    with open("strategies/btc_1h_momentum/config.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     params = config.get("params", {})
@@ -188,7 +188,7 @@ def main():
     POSITION_PCT = risk.get("max_position_pct", 0.05)
     FEE_PER_SIDE = config.get("execution", {}).get("fee_rate", 0.00055)
     ENSEMBLE_FOLDS = params.get("ensemble_folds", None)
-    MODELS_DIR = params.get("models_dir", "strategies/lgbm_classifier/models")
+    MODELS_DIR = params.get("models_dir", "strategies/btc_1h_momentum/models")
 
     # 모델 로드
     if ENSEMBLE_FOLDS:
@@ -198,10 +198,10 @@ def main():
             models.append(lgb.Booster(model_file=path))
         print(f"앙상블 모델: {len(models)}개 fold ({ENSEMBLE_FOLDS})")
     else:
-        model = lgb.Booster(model_file="strategies/lgbm_classifier/models/latest.txt")
+        model = lgb.Booster(model_file="strategies/btc_1h_momentum/models/latest.txt")
         models = None
 
-    with open("strategies/lgbm_classifier/models/feature_names.json") as f:
+    with open("strategies/btc_1h_momentum/models/feature_names.json") as f:
         feature_names = json.load(f)
 
     # 데이터 & 신호
@@ -241,7 +241,7 @@ def main():
 
     # 구간 정의
     ts = pd.to_datetime(df["timestamp"])
-    with open("strategies/lgbm_classifier/models/training_meta.json") as f:
+    with open("strategies/btc_1h_momentum/models/training_meta.json") as f:
         meta = json.load(f)
 
     if ENSEMBLE_FOLDS:

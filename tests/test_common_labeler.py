@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategies.lgbm_classifier.labeler import TripleBarrierLabeler
+from strategies._common.labeler import TripleBarrierLabeler
 
 
 @pytest.fixture

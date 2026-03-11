@@ -1,17 +1,17 @@
 strategy:
-  name: LGBMClassifierStrategy
+  name: btc_1h_momentum
   symbol: BTCUSDT
   timeframe: 1h
 
 params:
-  model_path: strategies/lgbm_classifier/models/latest.txt
-  feature_names_path: strategies/lgbm_classifier/models/feature_names.json
+  model_path: strategies/btc_1h_momentum/models/latest.txt
+  feature_names_path: strategies/btc_1h_momentum/models/feature_names.json
   confidence_threshold: 0.44
   upper_barrier_multiplier: 3.0
   lower_barrier_multiplier: 3.0
   max_holding_period: 24
   ensemble_folds: [11, 13]
-  models_dir: strategies/lgbm_classifier/models
+  models_dir: strategies/btc_1h_momentum/models
   funding_filter:
     enabled: true
     zscore_thresholds:

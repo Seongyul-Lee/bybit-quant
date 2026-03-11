@@ -43,11 +43,8 @@ def run(
     timeframe = timeframe or config["strategy"]["timeframe"]
 
     # 전략 인스턴스 생성
-    if strategy_name == "ma_crossover":
-        from strategies.ma_crossover.strategy import MACrossoverStrategy
-        strategy = MACrossoverStrategy(config=config.get("params", {}))
-    elif strategy_name == "lgbm_classifier":
-        from strategies.lgbm_classifier.strategy import LGBMClassifierStrategy
+    if strategy_name == "btc_1h_momentum":
+        from strategies.btc_1h_momentum.strategy import LGBMClassifierStrategy
         strategy = LGBMClassifierStrategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
@@ -64,12 +61,12 @@ def run(
 
     # 신호 생성 (벡터화 우선, fallback으로 루프)
     if hasattr(strategy, "generate_signals_vectorized"):
-        signal_series = strategy.generate_signals_vectorized(df)
+        signal_series, prob_series = strategy.generate_signals_vectorized(df)
         logger.info("벡터화 신호 생성 사용")
     else:
         signals = []
         for i in range(len(df)):
-            sig = strategy.generate_signal(df.iloc[: i + 1])
+            sig, _ = strategy.generate_signal(df.iloc[: i + 1])
             signals.append(sig)
         signal_series = pd.Series(signals, index=df.index)
         logger.info("루프 신호 생성 사용 (fallback)")
@@ -174,9 +171,9 @@ def run(
 
     # 모델 품질 지표 (LightGBM 전략 전용)
     model_quality_section = ""
-    if strategy_name == "lgbm_classifier":
+    if strategy_name == "btc_1h_momentum":
         import json as _json
-        meta_path = "strategies/lgbm_classifier/models/training_meta.json"
+        meta_path = "strategies/btc_1h_momentum/models/training_meta.json"
         if os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = _json.load(f)

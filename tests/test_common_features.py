@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategies.lgbm_classifier.features import FeatureEngine
+from strategies._common.features import FeatureEngine
 
 
 @pytest.fixture

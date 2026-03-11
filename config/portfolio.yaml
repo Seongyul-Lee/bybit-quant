@@ -1,0 +1,20 @@
+# config/portfolio.yaml
+
+portfolio:
+  active_strategies:
+    - btc_1h_momentum
+
+  allocation:
+    mode: equal
+    position_pct_per_strategy: 0.20
+
+  limits:
+    max_total_exposure: 0.60
+    max_symbol_exposure: 0.30
+    max_concurrent_positions: 5
+
+  risk:
+    max_portfolio_mdd: -0.10
+    max_daily_loss: -0.03
+    strategy_disable_threshold: 0.8
+    strategy_disable_min_trades: 50
