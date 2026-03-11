@@ -3,9 +3,12 @@
 config.yaml과 학습된 모델을 기반으로 구간별 성과를 측정한다.
 Post-Validation 구간에서 성공 기준 충족 여부를 판단한다.
 
-Post-Validation = 선택 fold의 val_end ~ 2026-01-19
+사용법:
+    python oos_validation.py --strategy btc_1h_momentum
+    python oos_validation.py --strategy eth_1h_momentum
 """
 
+import argparse
 import json
 import os
 
@@ -17,9 +20,14 @@ import yaml
 from strategies._common.features import FeatureEngine
 
 
-def load_config():
-    """config.yaml에서 파라미터를 로드."""
-    with open("strategies/btc_1h_momentum/config.yaml", "r", encoding="utf-8") as f:
+def load_config(strategy_name: str = "btc_1h_momentum"):
+    """config.yaml에서 파라미터를 로드.
+
+    Args:
+        strategy_name: 전략 폴더명.
+    """
+    config_path = f"strategies/{strategy_name}/config.yaml"
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
 
@@ -119,11 +127,19 @@ def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
     }
 
 
-def run_oos_validation():
-    """OOS 검증을 실행하고 결과를 출력."""
-    config = load_config()
+def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
+    """OOS 검증을 실행하고 결과를 출력.
+
+    Args:
+        strategy_name: 전략 폴더명.
+    """
+    config = load_config(strategy_name)
     params = config.get("params", {})
     risk = config.get("risk", {})
+    strat_cfg = config.get("strategy", {})
+
+    symbol = strat_cfg.get("symbol", "BTCUSDT")
+    timeframe = strat_cfg.get("timeframe", "1h")
 
     CONFIDENCE_THRESHOLD = params.get("confidence_threshold", 0.46)
     SL_PCT = risk.get("stop_loss_pct", 0.015)
@@ -132,7 +148,7 @@ def run_oos_validation():
     POSITION_PCT = risk.get("max_position_pct", 0.05)
     FEE_PER_SIDE = config.get("execution", {}).get("fee_rate", 0.00055)
     ENSEMBLE_FOLDS = params.get("ensemble_folds", None)
-    MODELS_DIR = params.get("models_dir", "strategies/btc_1h_momentum/models")
+    MODELS_DIR = params.get("models_dir", f"strategies/{strategy_name}/models")
 
     # 모델 로드 (앙상블 또는 단일)
     if ENSEMBLE_FOLDS:
@@ -142,15 +158,20 @@ def run_oos_validation():
             models.append(lgb.Booster(model_file=path))
         print(f"앙상블 모델: {len(models)}개 fold ({ENSEMBLE_FOLDS})")
     else:
-        model = lgb.Booster(model_file="strategies/btc_1h_momentum/models/latest.txt")
+        model_path = params.get("model_path", f"strategies/{strategy_name}/models/latest.txt")
+        model = lgb.Booster(model_file=model_path)
         models = None
         print("단일 모델 (latest.txt)")
 
-    with open("strategies/btc_1h_momentum/models/feature_names.json") as f:
+    feature_names_path = params.get(
+        "feature_names_path", f"strategies/{strategy_name}/models/feature_names.json"
+    )
+    with open(feature_names_path) as f:
         feature_names = json.load(f)
 
     # 학습 메타 로드
-    with open("strategies/btc_1h_momentum/models/training_meta.json") as f:
+    meta_path = os.path.join(MODELS_DIR, "training_meta.json")
+    with open(meta_path) as f:
         meta = json.load(f)
 
     # 앙상블일 때 PV 시작점 = 가장 최신 fold의 val_end
@@ -164,8 +185,10 @@ def run_oos_validation():
         val_end_str = fm["val_period"].split(" ~ ")[-1].strip()
 
     # 데이터 로드 & 시그널 생성
-    df = pd.read_parquet("data/processed/BTCUSDT_1h_features.parquet")
-    engine = FeatureEngine(config={})
+    data_path = f"data/processed/{symbol}_{timeframe}_features.parquet"
+    print(f"전략: {strategy_name} | 심볼: {symbol} | 타임프레임: {timeframe}")
+    df = pd.read_parquet(data_path)
+    engine = FeatureEngine(config={"symbol": symbol})
     df_feat = engine.compute_all_features(df)
 
     X = df_feat[feature_names]
@@ -315,4 +338,8 @@ def run_oos_validation():
 
 
 if __name__ == "__main__":
-    run_oos_validation()
+    parser = argparse.ArgumentParser(description="OOS 검증")
+    parser.add_argument("--strategy", type=str, default="btc_1h_momentum",
+                        help="전략 이름 (기본: btc_1h_momentum)")
+    args = parser.parse_args()
+    run_oos_validation(strategy_name=args.strategy)
