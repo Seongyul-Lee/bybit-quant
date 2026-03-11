@@ -1,8 +1,9 @@
 """bybit-quant 실거래/백테스트 진입점.
 
 사용법:
-    python main.py --strategy ma_crossover --mode live
-    python main.py --strategy ma_crossover --mode backtest
+    python main.py --mode live                                # 포트폴리오 모드 (portfolio.yaml 전체)
+    python main.py --strategy btc_1h_momentum --mode live     # 단일 전략 모드 (하위 호환)
+    python main.py --strategy btc_1h_momentum --mode backtest # 백테스트
 """
 
 import argparse
@@ -24,7 +25,7 @@ def load_strategy(strategy_name: str):
     """전략 이름으로 전략 인스턴스를 동적 로드.
 
     Args:
-        strategy_name: 전략 폴더명 (예: "ma_crossover").
+        strategy_name: 전략 폴더명 (예: "btc_1h_momentum").
 
     Returns:
         초기화된 전략 인스턴스.
@@ -126,28 +127,50 @@ def _collect_closed_pnl(trades: list, last_trade_ids: set) -> float:
     return pnl
 
 
-def run_live(strategy_name: str) -> None:
+def _load_portfolio_config() -> dict:
+    """config/portfolio.yaml 로드.
+
+    Returns:
+        portfolio 섹션 딕셔너리.
+    """
+    config_path = "config/portfolio.yaml"
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    return raw.get("portfolio", raw)
+
+
+def run_live(strategy_name: str | None = None) -> None:
     """실거래 모드 실행.
 
-    데이터 수집 → 신호 생성 → 리스크 체크 → 주문 실행 루프.
+    포트폴리오 레이어를 통해 전략을 관리한다.
+    --strategy 인자가 있으면 해당 전략만, 없으면 portfolio.yaml 전체.
 
     Args:
-        strategy_name: 전략 폴더명.
+        strategy_name: 전략 폴더명. None이면 portfolio.yaml 전체.
     """
     from src.data.collector import BybitDataCollector
     from src.risk.manager import RiskManager, PnLTracker
     from src.execution.executor import OrderExecutor
     from src.utils.notify import TelegramNotifier
+    from src.portfolio.manager import PortfolioManager
+    from src.portfolio.risk import PortfolioRiskManager
+    from src.portfolio.virtual_position import VirtualPositionTracker
 
-    strategy = load_strategy(strategy_name)
-    config_path = f"strategies/{strategy_name}/config.yaml"
-    with open(config_path, "r", encoding="utf-8") as f:
-        strategy_config = yaml.safe_load(f)
+    # 1. 포트폴리오 설정 로드
+    portfolio_config = _load_portfolio_config()
 
-    symbol_raw = strategy_config["strategy"]["symbol"]  # e.g. "BTCUSDT"
-    symbol = _convert_symbol(symbol_raw)
-    timeframe = strategy_config["strategy"]["timeframe"]
+    # --strategy 지정 시 해당 전략만 활성화
+    if strategy_name:
+        portfolio_config["active_strategies"] = [strategy_name]
 
+    # 2. 포트폴리오 매니저 초기화
+    portfolio_manager = PortfolioManager(portfolio_config)
+    portfolio_manager.load_strategies_from_config(portfolio_config)
+
+    portfolio_risk = PortfolioRiskManager(portfolio_config.get("risk", {}))
+    virtual_tracker = VirtualPositionTracker()
+
+    # 3. 인프라 초기화
     collector = BybitDataCollector()
     risk_manager = RiskManager()
     exchange = collector.exchange
@@ -155,15 +178,22 @@ def run_live(strategy_name: str) -> None:
     notifier = TelegramNotifier()
     pnl_tracker = PnLTracker()
 
-    # Step 1: 레버리지 설정
+    # 레버리지 설정
     leverage = risk_manager.params["position"]["max_leverage"]
-    try:
-        exchange.set_leverage(leverage, symbol)
-        logger.info(f"레버리지 설정: {leverage}x")
-    except Exception as e:
-        logger.warning(f"레버리지 설정 실패: {e}")
+    # 활성 전략의 심볼 집합
+    active_symbols: set[str] = set()
+    for name in portfolio_manager.get_active_strategies():
+        cfg = portfolio_manager.get_strategy_config(name)
+        sym_raw = cfg.get("strategy", {}).get("symbol", "BTCUSDT")
+        sym = _convert_symbol(sym_raw)
+        active_symbols.add(sym)
+        try:
+            exchange.set_leverage(leverage, sym)
+            logger.info(f"레버리지 설정: {leverage}x ({sym})")
+        except Exception as e:
+            logger.warning(f"레버리지 설정 실패 ({sym}): {e}")
 
-    # 저장된 상태 복원
+    # 4. 저장된 상태 복원
     saved_state = _load_saved_state()
     if "circuit_breaker" in saved_state:
         risk_manager.circuit_breaker.from_dict(saved_state["circuit_breaker"])
@@ -171,15 +201,21 @@ def run_live(strategy_name: str) -> None:
     if "pnl_tracker" in saved_state:
         pnl_tracker.from_dict(saved_state["pnl_tracker"])
         logger.info(f"PnLTracker 상태 복원: {saved_state['pnl_tracker']}")
-    last_processed_bar = saved_state.get("last_processed_bar")
+    if "virtual_positions" in saved_state:
+        virtual_tracker.from_dict(saved_state["virtual_positions"])
+        logger.info(f"가상 포지션 복원: {len(virtual_tracker.virtual_positions)}개 전략")
+    if "portfolio_risk" in saved_state:
+        portfolio_risk.from_dict(saved_state["portfolio_risk"])
+        logger.info("포트폴리오 리스크 상태 복원")
+
+    last_processed_bars: dict[str, str] = saved_state.get("last_processed_bars", {})
     last_trade_ids: set = set(saved_state.get("last_trade_ids", []))
 
-    # 시작 시 거래소 포지션 동기화
+    # 5. 거래소 포지션 동기화
     logger.info("시작 시 거래소 포지션 동기화...")
     prev_positions = executor.sync_positions()
     saved_positions = saved_state.get("positions", {})
 
-    # 불일치 감지 및 경고
     for sym in set(list(saved_positions.keys()) + list(prev_positions.keys())):
         saved = saved_positions.get(sym)
         actual = prev_positions.get(sym)
@@ -192,186 +228,232 @@ def run_live(strategy_name: str) -> None:
 
     logger.info(f"초기 포지션: {len(prev_positions)}개 (거래소 기준)")
 
-    # 폴링 주기 계산
-    tf_seconds = _timeframe_to_seconds(timeframe)
-    poll_interval = max(tf_seconds // 6, 30)
+    # 6. 폴링 주기 — 모든 전략 중 가장 짧은 타임프레임 기준
+    min_tf_seconds = float("inf")
+    for name in portfolio_manager.get_active_strategies():
+        cfg = portfolio_manager.get_strategy_config(name)
+        tf = cfg.get("strategy", {}).get("timeframe", "1h")
+        min_tf_seconds = min(min_tf_seconds, _timeframe_to_seconds(tf))
+    poll_interval = max(int(min_tf_seconds) // 6, 30)
 
-    logger.info(f"실거래 시작: {strategy_name} | {symbol} | {timeframe} | 폴링 {poll_interval}초")
+    active_names = ", ".join(portfolio_manager.get_active_strategies())
+    logger.info(f"실거래 시작: [{active_names}] | 폴링 {poll_interval}초")
+
+    # 7. 포트폴리오 가치 피크 추적
+    peak_value = 0.0
+
+    def _save_current_state() -> None:
+        """현재 상태를 atomic write로 저장."""
+        executor._save_state(prev_positions, extra_state={
+            "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
+            "pnl_tracker": pnl_tracker.to_dict(),
+            "virtual_positions": virtual_tracker.to_dict(),
+            "portfolio_risk": portfolio_risk.to_dict(),
+            "last_processed_bars": last_processed_bars,
+            "last_trade_ids": list(last_trade_ids)[-100:],
+        })
 
     while True:
         try:
-            # 1. 데이터 수집 (processor 없이 직접 — 전략이 내부에서 피처 계산)
-            df = collector.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=1000)
+            # 8. 각 전략별 데이터 수집 + 시그널 수집
+            data_dict: dict[str, pd.DataFrame] = {}
 
-            # 봉 중복 체크: 같은 봉이면 스킵
-            current_bar = str(df["timestamp"].iloc[-1])
-            if current_bar == last_processed_bar:
+            for name in portfolio_manager.get_active_strategies():
+                strategy = portfolio_manager.get_strategy(name)
+                cfg = portfolio_manager.get_strategy_config(name)
+                sym_raw = cfg.get("strategy", {}).get("symbol", "BTCUSDT")
+                sym = _convert_symbol(sym_raw)
+                tf = cfg.get("strategy", {}).get("timeframe", "1h")
+
+                df = collector.fetch_ohlcv(symbol=sym, timeframe=tf, limit=1000)
+                current_bar = str(df["timestamp"].iloc[-1])
+
+                # 봉 중복 체크
+                if current_bar == last_processed_bars.get(name):
+                    continue
+
+                data_dict[name] = df
+                last_processed_bars[name] = current_bar
+
+            if not data_dict:
                 time.sleep(poll_interval)
                 continue
 
-            # 2. 포지션 동기화 및 청산 감지
+            # 9. 포지션 동기화 및 청산 감지
             positions = executor.sync_positions()
 
-            # SL/TP 청산 감지: 이전에 있었는데 현재 없는 포지션
             for sym, prev_pos in prev_positions.items():
                 if sym not in positions:
                     logger.info(f"포지션 청산 감지: {sym}")
+                    # 해당 심볼의 가상 포지션도 청산
+                    strategies_with_pos = virtual_tracker.get_strategies_for_symbol(sym)
                     try:
                         trades = exchange.fetch_my_trades(sym, limit=5)
                         closed_pnl = _collect_closed_pnl(trades, last_trade_ids)
                         if closed_pnl != 0:
                             risk_manager.circuit_breaker.record_trade(closed_pnl)
                             pnl_tracker.record_pnl(closed_pnl)
+                            # PnL을 가상 포지션 보유 전략에 분배 (FIFO: 첫 전략에 할당)
+                            if strategies_with_pos:
+                                pnl_strategy = strategies_with_pos[0]
+                                portfolio_risk.record_trade(pnl_strategy, closed_pnl)
                             executor.record_closed_pnl(
                                 symbol=sym,
                                 pnl=closed_pnl,
-                                strategy_name=strategy_name,
+                                strategy_name=strategies_with_pos[0] if strategies_with_pos else "",
                                 reason="SL/TP 자동 청산",
                             )
                             logger.info(f"청산 PnL 기록: {closed_pnl:+.2f}")
                     except Exception as e:
                         logger.warning(f"청산 PnL 조회 실패: {e}")
+                    # 모든 관련 가상 포지션 청산
+                    for strat_name in strategies_with_pos:
+                        virtual_tracker.close(strat_name, sym)
 
-            # 3. 신호 생성
-            signal, prob = strategy.generate_signal(df)
+            # 10. 시그널 수집
+            signals = portfolio_manager.collect_signals(data_dict)
 
-            if signal == 0:
-                logger.info("신호: 중립 — 대기")
-                last_processed_bar = current_bar
+            # 시그널 없는 전략은 로깅
+            for name in data_dict:
+                sig = signals.get(name, (0, 0.0))
+                if sig[0] == 0:
+                    logger.info(f"{name}: 신호 중립 — 대기")
+
+            # 매수 시그널이 없으면 상태 저장 후 다음 루프
+            if not any(sig == 1 for sig, _ in signals.values()):
                 prev_positions = positions
-                # 상태 저장
-                executor._save_state(positions, extra_state={
-                    "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
-                    "pnl_tracker": pnl_tracker.to_dict(),
-                    "last_processed_bar": last_processed_bar,
-                    "last_trade_ids": list(last_trade_ids)[-100:],
-                })
+                _save_current_state()
                 time.sleep(poll_interval)
                 continue
 
-            # 4. 기존 포지션과 신호 방향 비교
-            signal_side = "long"  # 2클래스 롱 전용 모델
-            existing_pos = positions.get(symbol)
-
-            if existing_pos:
-                if existing_pos["side"] == signal_side:
-                    logger.info(f"이미 {signal_side} 포지션 보유 — 스킵")
-                    last_processed_bar = current_bar
-                    prev_positions = positions
-                    time.sleep(poll_interval)
-                    continue
-                else:
-                    # 반대 방향 → 기존 청산 먼저
-                    logger.info(f"포지션 반전: {existing_pos['side']} → {signal_side}")
-                    close_order = executor.close_position(symbol, existing_pos, strategy_name)
-                    if close_order:
-                        try:
-                            trades = exchange.fetch_my_trades(symbol, limit=5)
-                            closed_pnl = _collect_closed_pnl(trades, last_trade_ids)
-                            if closed_pnl != 0:
-                                risk_manager.circuit_breaker.record_trade(closed_pnl)
-                                pnl_tracker.record_pnl(closed_pnl)
-                                executor.record_closed_pnl(
-                                    symbol=symbol,
-                                    pnl=closed_pnl,
-                                    strategy_name=strategy_name,
-                                    reason="반전 청산",
-                                )
-                        except Exception as e:
-                            logger.warning(f"반전 청산 PnL 조회 실패: {e}")
-                    # 포지션 수 재조회
-                    positions = executor.sync_positions()
-
-            # 5. 리스크 체크
+            # 11. 포트폴리오 리스크 체크
             balance = exchange.fetch_balance()
             portfolio_value = float(balance.get("total", {}).get("USDT", 0))
+            peak_value = max(peak_value, portfolio_value)
 
-            # 변동성 계산
-            atr_value = _compute_atr(df)
-            current_vol = float(atr_value / df["close"].iloc[-1]) if atr_value > 0 else 0.0
-
-            ok, reason = risk_manager.check_all(
-                daily_pnl=pnl_tracker.daily_pnl,
-                portfolio_value=portfolio_value,
-                current_positions=len(positions),
-                current_volatility=current_vol,
-                monthly_pnl=pnl_tracker.monthly_pnl,
-            )
-
+            ok, reason = portfolio_risk.check_portfolio(portfolio_value, peak_value)
             if not ok:
-                logger.warning(f"리스크 체크 실패: {reason}")
-                notifier.send_sync(f"[경고] 리스크 체크 실패: {reason}")
-                if "Circuit Breaker" in reason:
-                    notifier.send_sync(
-                        f"[긴급] Circuit Breaker 발동 — 수동 리셋 필요: {reason}"
+                logger.warning(f"포트폴리오 리스크: {reason}")
+                notifier.send_sync(f"[경고] 포트폴리오 리스크: {reason}")
+                prev_positions = positions
+                _save_current_state()
+                time.sleep(poll_interval)
+                continue
+
+            # 12. 전략별 건강 체크 (비활성화된 전략 시그널 제거)
+            healthy_signals = {
+                name: sig
+                for name, sig in signals.items()
+                if portfolio_risk.check_strategy_health(name)
+            }
+            for name in signals:
+                if name not in healthy_signals:
+                    logger.warning(f"전략 비활성화: {name} (PF 미달)")
+                    notifier.send_sync(f"[경고] {name} 전략 비활성화 (PF 미달)")
+
+            # 13. 자본 배분 → 주문 목록
+            orders = portfolio_manager.allocate(
+                healthy_signals, portfolio_value, virtual_tracker
+            )
+
+            # 14. 각 주문 실행
+            for order in orders:
+                strat_name = order["strategy"]
+                sym = order["symbol"]
+                cfg = portfolio_manager.get_strategy_config(strat_name)
+
+                # 데이터에서 진입 가격 가져오기
+                df = data_dict.get(strat_name)
+                if df is None:
+                    continue
+                entry_price = float(df["close"].iloc[-1])
+
+                # 기존 포지션 체크
+                existing_pos = positions.get(sym)
+                if existing_pos:
+                    if existing_pos["side"] == "long":
+                        logger.info(f"이미 {sym} long 포지션 보유 — 스킵")
+                        continue
+
+                # 전략별 리스크 체크
+                atr_value = _compute_atr(df)
+                current_vol = float(atr_value / entry_price) if atr_value > 0 else 0.0
+
+                ok, reason = risk_manager.check_all(
+                    daily_pnl=pnl_tracker.daily_pnl,
+                    portfolio_value=portfolio_value,
+                    current_positions=len(positions),
+                    current_volatility=current_vol,
+                    monthly_pnl=pnl_tracker.monthly_pnl,
+                )
+
+                if not ok:
+                    logger.warning(f"리스크 체크 실패 ({strat_name}): {reason}")
+                    notifier.send_sync(f"[경고] 리스크 체크 실패: {reason}")
+                    if "Circuit Breaker" in reason:
+                        notifier.send_sync(
+                            f"[긴급] Circuit Breaker 발동 — 수동 리셋 필요: {reason}"
+                        )
+                    continue
+
+                # 포지션 사이징
+                atr = _compute_atr(df)
+                if atr <= 0:
+                    logger.warning(f"ATR 계산 불가 ({strat_name}) — 주문 스킵")
+                    continue
+
+                position_size = risk_manager.calculate_atr_position_size(
+                    portfolio_value=portfolio_value,
+                    atr=atr,
+                    entry_price=entry_price,
+                )
+
+                # SL/TP 계산
+                sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
+                tp_pct = cfg.get("risk", {}).get("take_profit_pct")
+                sl, tp = risk_manager.get_stop_take_profit(
+                    entry_price, "long",
+                    stop_loss_pct=sl_pct,
+                    take_profit_pct=tp_pct,
+                )
+
+                # 가상 포지션 생성
+                virtual_tracker.open(strat_name, sym, "long", position_size, entry_price)
+
+                # 실제 주문: 가상 합산과 실제의 차이만큼
+                current_real = positions.get(sym, {})
+                deltas = virtual_tracker.get_delta_orders(sym, current_real)
+
+                for delta in deltas:
+                    exec_order = executor.execute(
+                        symbol=delta["symbol"],
+                        side=delta["side"],
+                        amount=delta["amount"],
+                        order_type=cfg.get("execution", {}).get("order_type", "limit"),
+                        price=entry_price,
+                        strategy_name=strat_name,
+                        signal_score=1,
+                        stop_loss=sl,
+                        take_profit=tp,
                     )
-                last_processed_bar = current_bar
-                prev_positions = positions
-                executor._save_state(positions, extra_state={
-                    "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
-                    "pnl_tracker": pnl_tracker.to_dict(),
-                    "last_processed_bar": last_processed_bar,
-                    "last_trade_ids": list(last_trade_ids)[-100:],
-                })
-                time.sleep(poll_interval)
-                continue
 
-            # 6. 포지션 사이징
-            atr = _compute_atr(df)
-            if atr <= 0:
-                logger.warning("ATR 계산 불가 — 주문 스킵")
-                last_processed_bar = current_bar
-                prev_positions = positions
-                time.sleep(poll_interval)
-                continue
-            entry_price = float(df["close"].iloc[-1])
-            position_size = risk_manager.calculate_atr_position_size(
-                portfolio_value=portfolio_value,
-                atr=atr,
-                entry_price=entry_price,
-            )
+                    if exec_order:
+                        msg = (
+                            f"주문 실행: {delta['side'].upper()} "
+                            f"{delta['amount']:.4f} {sym} @ {entry_price:.2f} "
+                            f"({strat_name})"
+                        )
+                        logger.info(msg)
+                        notifier.send_sync(msg)
 
-            # 7. 주문 실행
-            side = "buy" if signal == 1 else "sell"
-            sl, tp = risk_manager.get_stop_take_profit(entry_price, signal_side)
-
-            order = executor.execute(
-                symbol=symbol,
-                side=side,
-                amount=position_size,
-                order_type=strategy_config.get("execution", {}).get("order_type", "limit"),
-                price=entry_price,
-                strategy_name=strategy_name,
-                signal_score=signal,
-                stop_loss=sl,
-                take_profit=tp,
-            )
-
-            if order:
-                msg = f"주문 실행: {side.upper()} {position_size:.4f} {symbol} @ {entry_price:.2f}"
-                logger.info(msg)
-                notifier.send_sync(msg)
-
-            last_processed_bar = current_bar
+            # 15. 상태 업데이트 및 저장
             prev_positions = executor.sync_positions()
-
-            # 상태 저장
-            executor._save_state(prev_positions, extra_state={
-                "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
-                "pnl_tracker": pnl_tracker.to_dict(),
-                "last_processed_bar": last_processed_bar,
-                "last_trade_ids": list(last_trade_ids)[-100:],
-            })
+            _save_current_state()
 
         except KeyboardInterrupt:
             logger.info("사용자에 의해 종료")
             try:
-                executor._save_state(prev_positions, extra_state={
-                    "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
-                    "pnl_tracker": pnl_tracker.to_dict(),
-                    "last_processed_bar": last_processed_bar,
-                    "last_trade_ids": list(last_trade_ids)[-100:],
-                })
+                _save_current_state()
                 logger.info("종료 전 상태 저장 완료")
             except Exception as e:
                 logger.error(f"종료 시 상태 저장 실패: {e}")
@@ -495,8 +577,8 @@ def main() -> None:
     parser.add_argument(
         "--strategy",
         type=str,
-        required=True,
-        help="전략 이름 (예: ma_crossover)",
+        default=None,
+        help="전략 이름 (미지정 시 portfolio.yaml 전체 로드)",
     )
     parser.add_argument(
         "--mode",
@@ -511,6 +593,9 @@ def main() -> None:
     if args.mode == "live":
         run_live(args.strategy)
     elif args.mode == "backtest":
+        if not args.strategy:
+            logger.error("백테스트 모드에서는 --strategy가 필수입니다.")
+            sys.exit(1)
         run_backtest(args.strategy)
 
 
