@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategies.lgbm_classifier.trainer import WalkForwardTrainer, LABEL_MAP
+from strategies.lgbm_classifier.trainer import WalkForwardTrainer
 
 
 @pytest.fixture
@@ -21,7 +21,7 @@ def sample_data() -> pd.DataFrame:
         "feature_1": np.random.randn(n),
         "feature_2": np.random.randn(n),
         "feature_3": np.random.randn(n),
-        "label": np.random.choice([-1, 0, 1], size=n),
+        "label": np.random.choice([0, 1], size=n),
     })
 
     return df
@@ -99,12 +99,6 @@ class TestWalkForwardTrainer:
         trainer = WalkForwardTrainer(min_train_months=6, val_months=1)
         folds = trainer.generate_folds(df)
         assert len(folds) == 0
-
-    def test_label_mapping(self) -> None:
-        """라벨 매핑 (-1→0, 0→1, 1→2)이 올바른지 확인."""
-        assert LABEL_MAP[-1] == 0
-        assert LABEL_MAP[0] == 1
-        assert LABEL_MAP[1] == 2
 
     def test_fold_has_required_keys(self, sample_data: pd.DataFrame) -> None:
         """각 fold에 필수 키가 있는지 확인."""

@@ -19,11 +19,6 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("lgbm_trainer")
 
-# 라벨 매핑: 원본(-1,0,1) → 학습용(0,1,2) / 역매핑(0,1,2) → 원본(-1,0,1)
-LABEL_MAP = {-1: 0, 0: 1, 1: 2}
-LABEL_MAP_INV = {0: -1, 1: 0, 2: 1}
-
-
 class WalkForwardTrainer:
     """Walk-Forward 방식으로 LightGBM 모델을 학습.
 
@@ -41,14 +36,15 @@ class WalkForwardTrainer:
     # LightGBM 고정 파라미터
     FIXED_PARAMS: dict[str, Any] = {
         "boosting_type": "gbdt",
-        "objective": "multiclass",
-        "num_class": 3,
-        "metric": "multi_logloss",
-        "n_estimators": 1000,
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "n_estimators": 2000,
         "bagging_freq": 1,
-        "max_depth": 6,
-        "class_weight": "balanced",
+        "max_depth": -1,       # 제한 없음 (num_leaves로만 제어)
+        "is_unbalance": False,  # 라벨 52/48 거의 균형 → 불필요
         "verbose": -1,
+        "seed": 42,
+        "deterministic": True,
     }
 
     def __init__(
@@ -169,30 +165,36 @@ class WalkForwardTrainer:
         def objective(trial: optuna.Trial) -> float:
             params = {
                 **self.FIXED_PARAMS,
-                "num_leaves": trial.suggest_int("num_leaves", 7, 31),
-                "min_child_samples": trial.suggest_int("min_child_samples", 50, 200),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 31),
+                "min_child_samples": trial.suggest_int("min_child_samples", 80, 200),
+                "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.03, log=True),
                 "reg_alpha": trial.suggest_float("reg_alpha", 0.5, 5.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 10.0, log=True),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 0.8),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 5.0, log=True),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.3, 0.7),
                 "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.8),
+                "max_depth": trial.suggest_int("max_depth", 4, 6),
             }
 
             model = lgb.LGBMClassifier(**params)
             model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
-                callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
             )
 
-            y_pred = model.predict(X_val)
-            return f1_score(y_val, y_pred, average="macro")
+            y_pred_train = model.predict(X_train)
+            y_pred_val = model.predict(X_val)
+            train_f1 = f1_score(y_train, y_pred_train, average="binary", pos_label=1)
+            val_f1 = f1_score(y_val, y_pred_val, average="binary", pos_label=1)
+            gap = train_f1 - val_f1
+            # F1에서 과적합 갭 페널티 차감 → 일반화 성능 우선
+            return val_f1 - 0.5 * max(gap - 0.1, 0)
 
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=self.n_optuna_trials)
 
         best_params = {**self.FIXED_PARAMS, **study.best_params}
-        logger.info(f"Optuna 최적 F1(macro): {study.best_value:.4f}")
+        logger.info(f"Optuna 최적 F1(binary): {study.best_value:.4f}")
         logger.info(f"최적 파라미터: {study.best_params}")
 
         return best_params
@@ -221,16 +223,16 @@ class WalkForwardTrainer:
         model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
         )
 
         y_pred_train = model.predict(X_train)
         y_pred_val = model.predict(X_val)
         y_proba_val = model.predict_proba(X_val)
 
-        train_f1 = f1_score(y_train, y_pred_train, average="macro")
-        val_f1 = f1_score(y_val, y_pred_val, average="macro")
-        val_logloss = log_loss(y_val, y_proba_val, labels=[0, 1, 2])
+        train_f1 = f1_score(y_train, y_pred_train, average="binary", pos_label=1)
+        val_f1 = f1_score(y_val, y_pred_val, average="binary", pos_label=1)
+        val_logloss = log_loss(y_val, y_proba_val, labels=[0, 1])
 
         fold_metrics = {
             "train_f1_macro": float(train_f1),
@@ -269,9 +271,7 @@ class WalkForwardTrainer:
         if not folds:
             raise ValueError("fold를 생성할 수 없습니다. 데이터가 충분한지 확인하세요.")
 
-        # 라벨 매핑 (-1→0, 0→1, 1→2)
         df = df.copy()
-        df[label_col] = df[label_col].map(LABEL_MAP)
 
         # 첫 fold에서 Optuna 튜닝
         first_fold = folds[0]
@@ -286,13 +286,15 @@ class WalkForwardTrainer:
         else:
             best_params = {
                 **self.FIXED_PARAMS,
-                "num_leaves": 15,              # H-1: 62→15 (과적합 억제)
-                "min_child_samples": 100,      # H-3: 44→100 (leaf 분할 제약)
-                "learning_rate": 0.05,
-                "reg_alpha": 1.5,              # L1 정규화 유지
-                "reg_lambda": 2.0,             # H-2: 0.012→2.0 (L2 정규화 활성화)
-                "feature_fraction": 0.6,       # H-4: 0.33→0.6 (피처 다양성)
-                "bagging_fraction": 0.7,       # 0.52→0.7
+                "num_leaves": 15,
+                "min_child_samples": 150,
+                "learning_rate": 0.02,
+                "reg_alpha": 3.0,
+                "reg_lambda": 5.0,
+                "feature_fraction": 0.5,
+                "bagging_fraction": 0.7,
+                "max_depth": 4,
+                "n_estimators": 200,
             }
 
         # 모든 fold에서 학습
@@ -328,30 +330,54 @@ class WalkForwardTrainer:
             folds_metrics.append(metrics)
             fold_models.append(model)
 
-        # 모델 선택: 최신 fold부터 역순으로, gap ≤ threshold인 첫 번째 fold 선택
-        # 모두 threshold 초과 시 최신 fold 사용 (경고 출력)
+        # 모델 선택: gap 최소 우선 (일반화 성능 최우선)
+        # 1. 학습 실패 fold 제외 (train_f1 < 0.01)
+        # 2. gap ≤ max_overfit_gap인 fold만 후보
+        # 3. 후보 중 Val F1 ≥ 0.40 (최소 품질 기준)
+        # 4. 조건 충족 fold 중 gap이 가장 낮은 fold 선택
+        # 5. gap 동점이면 최신 fold 우선
         selected_model = None
         selected_fold_idx = -1
 
-        for i in range(len(folds) - 1, -1, -1):
-            gap = folds_metrics[i]["overfit_gap"]
-            if gap <= self.max_overfit_gap:
-                selected_model = fold_models[i]
-                selected_fold_idx = i
-                logger.info(
-                    f"모델 선택: Fold {i} (Val F1: {folds_metrics[i]['val_f1_macro']:.4f}, "
-                    f"gap: {gap:.4f}) — 최신 적합 fold"
-                )
-                break
+        MIN_VAL_F1 = 0.40
+        MIN_TRAIN_F1 = 0.01  # 학습 실패 제외 기준
 
-        if selected_model is None:
-            # 모든 fold가 과적합 — 최신 fold 사용 (가장 많은 데이터로 학습됨)
-            selected_model = fold_models[-1]
-            selected_fold_idx = len(folds) - 1
+        # 유효 fold 필터링: 학습 성공 + gap ≤ threshold + Val F1 ≥ 최소 기준
+        eligible = [
+            (i, folds_metrics[i]["val_f1_macro"], folds_metrics[i]["overfit_gap"])
+            for i in range(len(folds))
+            if folds_metrics[i]["train_f1_macro"] >= MIN_TRAIN_F1
+            and folds_metrics[i]["overfit_gap"] <= self.max_overfit_gap
+            and folds_metrics[i]["val_f1_macro"] >= MIN_VAL_F1
+        ]
+
+        if eligible:
+            # 최신 fold 우선 (더 많은 학습 데이터 + 최근 패턴),
+            # 동점이면 Val F1 높은 쪽 우선
+            best = max(eligible, key=lambda x: (x[0], x[1]))
+            selected_fold_idx = best[0]
+            selected_model = fold_models[selected_fold_idx]
+            logger.info(
+                f"모델 선택: Fold {selected_fold_idx} "
+                f"(Val F1: {best[1]:.4f}, gap: {best[2]:.4f}) "
+                f"— {len(eligible)}개 적합 fold 중 최신 fold"
+            )
+        else:
+            # Fallback: 학습 성공 fold 중 gap 최소
+            valid = [
+                (i, folds_metrics[i]["val_f1_macro"], folds_metrics[i]["overfit_gap"])
+                for i in range(len(folds))
+                if folds_metrics[i]["train_f1_macro"] >= MIN_TRAIN_F1
+            ]
+            if valid:
+                best = min(valid, key=lambda x: (x[2], -x[0]))
+            else:
+                best = (len(folds) - 1, folds_metrics[-1]["val_f1_macro"], folds_metrics[-1]["overfit_gap"])
+            selected_fold_idx = best[0]
+            selected_model = fold_models[selected_fold_idx]
             logger.warning(
-                f"모든 fold가 과적합 (gap > {self.max_overfit_gap}). "
-                f"최신 Fold {selected_fold_idx} 사용 "
-                f"(Val F1: {folds_metrics[selected_fold_idx]['val_f1_macro']:.4f})"
+                f"적합 fold 없음 — Fold {selected_fold_idx} 사용 "
+                f"(gap: {best[2]:.4f}, Val F1: {best[1]:.4f})"
             )
 
         selected_val_f1 = folds_metrics[selected_fold_idx]["val_f1_macro"]
@@ -370,6 +396,7 @@ class WalkForwardTrainer:
             "feature_importance": importance,
             "best_fold_idx": selected_fold_idx,
             "best_val_f1": selected_val_f1,
+            "fold_models": fold_models,
         }
 
     def save_model(
@@ -382,6 +409,7 @@ class WalkForwardTrainer:
         save_dir: str,
         best_fold_idx: int = -1,
         best_val_f1: float = 0.0,
+        fold_models: list[lgb.LGBMClassifier] | None = None,
     ) -> str:
         """학습 결과를 atomic write로 저장.
 
@@ -423,6 +451,13 @@ class WalkForwardTrainer:
             "feature_importance": feature_importance,
         }
         self._atomic_write_json(meta_path, meta)
+
+        # 모든 fold 모델 저장
+        if fold_models:
+            for i, fm in enumerate(fold_models):
+                fold_path = os.path.join(save_dir, f"fold_{i:02d}.txt")
+                self._atomic_write_text(fold_path, fm.booster_.model_to_string())
+            logger.info(f"전체 fold 모델 {len(fold_models)}개 저장 완료")
 
         logger.info(f"모델 저장 완료: {save_dir}")
         return model_path

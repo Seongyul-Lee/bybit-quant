@@ -194,6 +194,7 @@ def main() -> None:
         save_dir=save_dir,
         best_fold_idx=result["best_fold_idx"],
         best_val_f1=result["best_val_f1"],
+        fold_models=result.get("fold_models"),
     )
 
     # 6. 결과 출력

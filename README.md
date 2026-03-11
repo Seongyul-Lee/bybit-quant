@@ -2,7 +2,7 @@
 
 Bybit 거래소 기반 암호화폐 퀀트 트레이딩 시스템.
 백테스팅과 실거래가 동일한 전략 코드(`BaseStrategy.generate_signal`)를 공유하는 구조로,
-규칙 기반(MA Crossover)과 ML 기반(LightGBM 3클래스 분류) 전략을 지원한다.
+규칙 기반(MA Crossover)과 ML 기반(LightGBM 2클래스 분류, 롱 전용, 앙상블 지원) 전략을 지원한다.
 
 ---
 
@@ -74,12 +74,18 @@ python backtest.py --strategy ma_crossover --symbol BTCUSDT --timeframe 1h
 ### 5. LightGBM 모델 학습 (ML 전략 사용 시)
 
 ```bash
-python train_lgbm.py --symbol BTCUSDT --timeframe 1h
-python train_lgbm.py --symbol BTCUSDT --timeframe 1h --optuna-trials 100
-python train_lgbm.py --symbol BTCUSDT --timeframe 1h --no-optuna
+python train_lgbm.py --no-optuna                            # 기본 학습
+python train_lgbm.py --optuna-trials 100                    # Optuna 튜닝 학습
 ```
 
-### 6. 실거래
+### 6. OOS 검증 및 실험 자동화
+
+```bash
+python oos_validation.py                                    # OOS (Out-of-Sample) 검증
+python run_experiment.py --threshold 0.48 --no-optuna       # 학습→OOS 검증 자동화
+```
+
+### 7. 실거래
 
 ```bash
 python main.py --strategy ma_crossover --mode live
@@ -95,7 +101,7 @@ python main.py --strategy lgbm_classifier --mode live
 ```
 BybitDataCollector.fetch_ohlcv()
   -> DataProcessor.add_features()
-  -> Strategy.generate_signal(df) -> signal (1/0/-1)
+  -> Strategy.generate_signal(df) -> signal (1=매수, 0=중립)
   -> RiskManager.check_all() -> 통과 여부
   -> RiskManager.calculate_atr_position_size() -> 포지션 크기
   -> RiskManager.get_stop_take_profit() -> SL/TP 가격
@@ -116,10 +122,11 @@ data/processed/ Parquet 로드
 
 ```
 data/processed/ Parquet 로드
-  -> FeatureEngine.compute_all_features() -> ~50개 피처
-  -> TripleBarrierLabeler.generate_labels() -> 3클래스 라벨 (1/0/-1)
+  -> FeatureEngine.compute_all_features() -> ~47개 피처 (선별 시 18개)
+  -> TripleBarrierLabeler.generate_labels() -> 2클래스 라벨 (1=매수/0=비매수)
   -> WalkForwardTrainer.run() -> 확장 윈도우 학습 + Optuna 튜닝
   -> 모델 저장 (strategies/lgbm_classifier/models/)
+  -> oos_validation.py로 OOS 검증
 ```
 
 ---
@@ -139,12 +146,14 @@ Fast/Slow MA 크로스오버로 매매 신호를 생성하며, 4개 필터로 wh
 
 ### LightGBM Classifier (ML 기반)
 
-LightGBM 3클래스 분류 모델로 `predict_proba` 기반 매매 신호를 생성한다.
+LightGBM 2클래스 분류 모델로 `predict_proba` 기반 매매 신호를 생성한다. **롱 전용** (1=매수, 0=비매수).
 
-- **피처**: ~50개 (기술적 지표, 가격/거래량 파생, 시간 피처, 멀티타임프레임)
-- **라벨링**: Triple Barrier (상단 2×ATR, 하단 1×ATR, 최대 보유 24봉)
+- **피처**: ~47개 전체 또는 18개 선별 (기술적 지표, 가격/거래량 파생, 시간 피처, 멀티타임프레임)
+- **라벨링**: Triple Barrier (상단 1.8×ATR, 하단 1.8×ATR 대칭, 최대 보유 16봉)
 - **학습**: Walk-Forward 확장 윈도우 (최소 6개월 학습, 1개월 검증, 24봉 embargo)
 - **튜닝**: Optuna (첫 fold에서만 튜닝, 이후 동일 파라미터 적용)
+- **앙상블**: 여러 fold 모델 평균 예측 (`config.yaml`의 `ensemble_folds` 설정)
+- **OOS 검증**: IS/PV 성과 비교로 일반화 성능 확인 (PF 하락률 50% 이내 목표)
 
 ---
 
@@ -159,7 +168,7 @@ LightGBM 3클래스 분류 모델로 `predict_proba` 기반 매매 신호를 생
 | 최대 레버리지 | 3배 |
 | 일일 손실 한도 | 3% |
 | 월간 손실 한도 | 10% |
-| 기본 손절 / 익절 | 2% / 4% (R:R = 1:2) |
+| 기본 손절 / 익절 | 1.5% / 1.5% (대칭) |
 | 거래당 위험 | 1% |
 | Circuit Breaker | 연속 손실 5회 또는 변동성 5% 초과 시 발동 |
 
@@ -184,10 +193,13 @@ strategies/
   ma_crossover/      규칙 기반 전략 (strategy.py + config.yaml)
   lgbm_classifier/   ML 전략 (strategy.py, features.py, labeler.py, trainer.py, evaluator.py, models/)
 reports/             backtest/, live/ (일별 JSON), trades/ (trade_log.csv)
-tests/               8개 테스트 모듈
-main.py              실거래/백테스트 진입점
+docs/                모델 분석 리포트
+tests/               테스트 모듈
+main.py              실거래 진입점
 backtest.py          백테스트 단독 실행
 train_lgbm.py        LightGBM 학습 CLI
+oos_validation.py    OOS (Out-of-Sample) 검증
+run_experiment.py    학습→OOS 검증 자동화
 ```
 
 ---
@@ -195,7 +207,7 @@ train_lgbm.py        LightGBM 학습 CLI
 ## 새 전략 추가
 
 1. `strategies/{name}/` 폴더 생성
-2. `strategy.py` - `BaseStrategy` 상속, `generate_signal(df) -> int` 구현 (1=매수, -1=매도, 0=중립)
+2. `strategy.py` - `BaseStrategy` 상속, `generate_signal(df) -> int` 구현 (1=매수, 0=중립; 롱 전용 전략은 -1 미사용)
 3. `config.yaml` - strategy, params, execution, risk 섹션 포함
 4. (선택) `generate_signals_vectorized(df) -> pd.Series` 구현으로 백테스트 고속화
 5. `main.py:load_strategy()`와 `backtest.py:run()`에 전략 import 분기 추가
@@ -223,6 +235,15 @@ python -m pytest tests/test_risk_manager.py::test_function_name -v  # 단일 테
 
 ---
 
+## 모델 버전 관리
+
+유의미한 모델은 **git 커밋 + 태그**로 보존한다 (`model/{전략}/{run번호}`).
+
+- 커밋 대상: `data/`, `strategies/**/models/`, `strategies/**/config.yaml`
+- 주의: raw 재수집 시 값 미세 변동, Optuna 비결정성 → 좋은 모델은 즉시 커밋
+
+---
+
 ## 문서
 
 | 파일 | 설명 |
@@ -233,6 +254,7 @@ python -m pytest tests/test_risk_manager.py::test_function_name -v  # 단일 테
 | `STRATEGY.md` | 전략 개발 가이드 |
 | `RISK_MANAGEMENT.md` | 리스크 관리 원칙 및 구현 |
 | `MONITORING.md` | 모니터링, 알림, 운영 가이드 |
+| `docs/*.md` | 모델 분석 리포트 (run별) |
 
 ---
 

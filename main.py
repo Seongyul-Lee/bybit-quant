@@ -253,7 +253,7 @@ def run_live(strategy_name: str) -> None:
                 continue
 
             # 4. 기존 포지션과 신호 방향 비교
-            signal_side = "long" if signal == 1 else "short"
+            signal_side = "long"  # 2클래스 롱 전용 모델
             existing_pos = positions.get(symbol)
 
             if existing_pos:
@@ -436,7 +436,7 @@ def run_backtest(strategy_name: str) -> None:
     portfolio = vbt.Portfolio.from_signals(
         close=df["close"],
         entries=(signal_series == 1),
-        exits=(signal_series == -1),
+        exits=pd.Series(False, index=signal_series.index),  # SL/TP에만 의존
         fees=0.0004,
         slippage=0.002,
         init_cash=1_000_000,

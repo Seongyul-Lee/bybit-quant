@@ -21,6 +21,6 @@ execution:
   fee_rate: 0.00055       # Bybit Taker 0.055% (보수적 기준)
 
 risk:
-  max_position_pct: 0.05  # 자산의 5%
+  max_position_pct: 0.20  # 자산의 5%
   stop_loss_pct: 0.02     # 2% 손절
   take_profit_pct: 0.04   # 4% 익절

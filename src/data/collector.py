@@ -156,6 +156,63 @@ class BybitDataCollector:
         logger.info(f"펀딩비 수집 완료: {symbol} ({len(df)}건)")
         return df
 
+    def fetch_funding_rate_bulk(
+        self,
+        symbol: str = "BTC/USDT:USDT",
+        since: str = "2024-01-01T00:00:00Z",
+        sleep_sec: float = 0.3,
+    ) -> pd.DataFrame:
+        """대량 펀딩비 이력을 페이지네이션으로 수집.
+
+        Bybit 펀딩비는 8시간 간격 (UTC 0:00, 8:00, 16:00).
+        limit=100이면 약 33일분. 2024-01 ~ 현재 = ~2,400건 → 약 24회 호출.
+
+        Args:
+            symbol: 거래 심볼.
+            since: 수집 시작 시점 ISO 8601 문자열.
+            sleep_sec: 요청 간 대기 시간 (초). Rate limit 준수용.
+
+        Returns:
+            전체 기간의 펀딩비 데이터프레임 (timestamp, symbol, funding_rate).
+        """
+        all_data: list[pd.DataFrame] = []
+        since_ts = self.exchange.parse8601(since)
+
+        while True:
+            raw = self.exchange.fetch_funding_rate_history(
+                symbol=symbol,
+                since=since_ts,
+                limit=100,
+            )
+            if not raw:
+                break
+
+            records = [
+                {
+                    "timestamp": r["timestamp"],
+                    "symbol": r["symbol"],
+                    "funding_rate": r["fundingRate"],
+                }
+                for r in raw
+            ]
+            df = pd.DataFrame(records)
+            all_data.append(df)
+
+            since_ts = int(raw[-1]["timestamp"]) + 1
+            if len(raw) < 100:
+                break
+
+            time.sleep(sleep_sec)
+
+        if not all_data:
+            return pd.DataFrame(columns=["timestamp", "symbol", "funding_rate"])
+
+        result = pd.concat(all_data, ignore_index=True)
+        result["timestamp"] = pd.to_datetime(result["timestamp"], unit="ms", utc=True)
+        result = result.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        logger.info(f"펀딩비 대량 수집 완료: {symbol} ({len(result)}건)")
+        return result
+
     def save_ohlcv(self, df: pd.DataFrame, symbol: str, timeframe: str) -> list[str]:
         """OHLCV 데이터를 월별 Parquet 파일로 저장.
 

@@ -1,12 +1,16 @@
 """LightGBM 전략용 피처 엔지니어링 모듈.
 
-약 50개 피처를 계산한다:
+약 65개 피처를 계산한다:
 - 기술적 지표 (MA, RSI, MACD, BB, ATR, ADX, Stochastic, OBV)
 - 가격 파생 (수익률, 로그수익률, 변동폭)
 - 거래량 파생 (변화율, 비율)
+- 변동성 구조 (ATR 비율, skewness, kurtosis, Parkinson)
+- 거래량 미세구조 (VWAP, 가격-거래량 상관)
 - 시간 피처 (cyclical encoding)
-- 멀티타임프레임 (4h, 1d resample)
+- 멀티타임프레임 (4h, 1d resample — RSI, MA, ATR, ADX, BB)
 """
+
+import os
 
 import numpy as np
 import pandas as pd
@@ -45,8 +49,11 @@ class FeatureEngine:
         df = self._add_technical_indicators(df)
         df = self._add_price_features(df)
         df = self._add_volume_features(df)
+        df = self._add_volatility_structure_features(df)
+        df = self._add_volume_microstructure_features(df)
         df = self._add_time_features(df)
         df = self._add_multitimeframe_features(df)
+        df = self._add_funding_features(df)
 
         self._feature_names = [
             c for c in df.columns
@@ -74,22 +81,26 @@ class FeatureEngine:
             선별된 피처 컬럼 이름 리스트.
         """
         selected = [
-            # 정규화된 MA 비율 (4개)
-            "ma_10_ratio", "ma_30_ratio", "ma_50_ratio", "ma_200_ratio",
+            # 정규화된 MA 비율 (3개 — 원본 모델 기준)
+            "ma_10_ratio", "ma_30_ratio", "ma_200_ratio",
             # 모멘텀 (3개)
             "rsi_14", "macd_hist", "stoch_k",
             # 변동성 (3개)
             "atr_14_pct", "bb_width", "bb_position",
             # 추세 (1개)
             "adx_14",
-            # 가격 파생 (3개)
-            "return_1", "return_5", "return_20",
+            # 가격 파생 (1개)
+            "return_1",
             # 거래량 (1개)
             "volume_ratio",
             # 시간 (2개)
             "hour_sin", "hour_cos",
             # 멀티타임프레임 (2개)
             "rsi_14_1d", "ma_50_1d_ratio",
+            # 변동성 구조 (2개)
+            "vol_ratio_7_30", "return_skew_20",
+            # 펀딩비 (1개 — 극단값 감지)
+            "funding_rate_zscore",
         ]
         return [f for f in selected if f in self._feature_names]
 
@@ -204,6 +215,53 @@ class FeatureEngine:
 
         return df
 
+    # ── 변동성 구조 피처 ────────────────────────────────────
+
+    def _add_volatility_structure_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """ATR 비율, 수익률 skewness/kurtosis, Parkinson 변동성 등 계산."""
+        # ATR(7) / ATR(30) — 변동성 확장/축소
+        atr_7 = self._compute_atr_series(df, 7)
+        atr_30 = self._compute_atr_series(df, 30)
+        df["vol_ratio_7_30"] = atr_7 / atr_30.replace(0, np.nan)
+
+        # 수익률 skewness / kurtosis (rolling 20봉)
+        ret = df["close"].pct_change()
+        df["return_skew_20"] = ret.rolling(20).skew()
+        df["return_kurt_20"] = ret.rolling(20).kurt()
+
+        # Parkinson volatility (high-low 기반, rolling 20봉)
+        log_hl = np.log(df["high"] / df["low"].replace(0, np.nan))
+        df["parkinson_vol_20"] = np.sqrt(
+            (log_hl ** 2).rolling(20).mean() / (4 * np.log(2))
+        )
+
+        # 상단/하단 그림자 비율 (매수/매도 압력 프록시)
+        atr = self._get_or_compute_atr(df).replace(0, np.nan)
+        df["upper_shadow_ratio"] = (df["high"] - df[["close", "open"]].max(axis=1)) / atr
+        df["lower_shadow_ratio"] = (df[["close", "open"]].min(axis=1) - df["low"]) / atr
+
+        return df
+
+    # ── 거래량 미세구조 피처 ──────────────────────────────
+
+    def _add_volume_microstructure_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """VWAP 편차, 거래량 skewness, 가격-거래량 상관관계 계산."""
+        # VWAP(20) 대비 현재가 편차 (ATR 정규화)
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        cumvol = df["volume"].rolling(20).sum().replace(0, np.nan)
+        vwap = (typical_price * df["volume"]).rolling(20).sum() / cumvol
+        atr = self._get_or_compute_atr(df).replace(0, np.nan)
+        df["vwap_deviation"] = (df["close"] - vwap) / atr
+
+        # 거래량 skewness (rolling 20봉)
+        df["volume_skew_20"] = df["volume"].rolling(20).skew()
+
+        # 가격-거래량 상관관계 (rolling 20봉)
+        ret = df["close"].pct_change()
+        df["price_volume_corr_20"] = ret.rolling(20).corr(df["volume"])
+
+        return df
+
     # ── 시간 피처 ────────────────────────────────────────────
 
     def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -232,10 +290,13 @@ class FeatureEngine:
         if "timestamp" not in df.columns:
             return df
 
-        df_ts = df.set_index(pd.to_datetime(df["timestamp"]))
+        ts_index = pd.to_datetime(df["timestamp"])
+        df_ts = df.set_index(ts_index)
+        ohlcv_cols = df[["open", "high", "low", "close", "volume"]].copy()
+        ohlcv_cols.index = ts_index
 
         for tf_label, rule in [("4h", "4h"), ("1d", "1D")]:
-            ohlcv_resampled = df_ts.resample(rule, label="right", closed="right").agg({
+            ohlcv_resampled = ohlcv_cols.resample(rule, label="right", closed="right").agg({
                 "open": "first",
                 "high": "max",
                 "low": "min",
@@ -261,6 +322,99 @@ class FeatureEngine:
             atr = self._compute_atr_series(ohlcv_resampled, 14)
             atr = atr.reindex(df_ts.index, method="ffill")
             df[f"atr_14_{tf_label}"] = atr.values
+
+            # ADX
+            adx = self._compute_adx(ohlcv_resampled, 14)
+            adx = adx.reindex(df_ts.index, method="ffill")
+            df[f"adx_14_{tf_label}"] = adx.values
+
+            # BB position
+            bb_mid = ohlcv_resampled["close"].rolling(20).mean()
+            bb_std = ohlcv_resampled["close"].rolling(20).std()
+            bb_upper = bb_mid + 2 * bb_std
+            bb_lower = bb_mid - 2 * bb_std
+            bb_range = (bb_upper - bb_lower).replace(0, np.nan)
+            bb_pos = (ohlcv_resampled["close"] - bb_lower) / bb_range
+            bb_pos = bb_pos.fillna(0.5)
+            bb_pos = bb_pos.reindex(df_ts.index, method="ffill")
+            df[f"bb_position_{tf_label}"] = bb_pos.values
+
+        # ATR 비율: 1h ATR / 1d ATR (크로스타임프레임 변동성 비교)
+        if "atr_14_1d" in df.columns:
+            atr_1h = self._get_or_compute_atr(df)
+            df["atr_ratio_1h_1d"] = atr_1h / df["atr_14_1d"].replace(0, np.nan)
+
+        return df
+
+    # ── 펀딩비 피처 ──────────────────────────────────────────
+
+    def _add_funding_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """펀딩비 파생 피처 생성.
+
+        Bybit 펀딩비는 8시간 간격 (UTC 0:00, 8:00, 16:00).
+        1h 봉에 merge할 때 merge_asof(direction='backward')로
+        현재 시점 이전의 가장 최근 펀딩비만 사용 (look-ahead bias 방지).
+
+        Args:
+            df: OHLCV + 기존 피처가 추가된 데이터프레임.
+
+        Returns:
+            펀딩비 피처가 추가된 데이터프레임.
+        """
+        funding_path = "data/raw/bybit/BTCUSDTUSDT/funding_rate.parquet"
+        if not os.path.exists(funding_path):
+            return df
+
+        funding = pd.read_parquet(funding_path)
+        funding["timestamp"] = pd.to_datetime(funding["timestamp"], utc=True)
+        funding = funding.sort_values("timestamp").reset_index(drop=True)
+
+        # merge_asof: 각 1h 봉에 대해 해당 시점 이전의 가장 최근 펀딩비를 매칭
+        df_ts = pd.to_datetime(df["timestamp"], utc=True)
+        merge_df = pd.DataFrame({"timestamp": df_ts}).reset_index()
+        # timestamp 해상도 통일 (us/ms 불일치 방지)
+        merge_df["timestamp"] = merge_df["timestamp"].astype("datetime64[ns, UTC]")
+        funding_merge = funding[["timestamp", "funding_rate"]].rename(
+            columns={"funding_rate": "_fr"}
+        ).copy()
+        funding_merge["timestamp"] = funding_merge["timestamp"].astype("datetime64[ns, UTC]")
+        merged = pd.merge_asof(
+            merge_df.sort_values("timestamp"),
+            funding_merge,
+            on="timestamp",
+            direction="backward",
+        ).sort_values("index").set_index("index")
+
+        fr = merged["_fr"]
+        fr.index = df.index
+
+        # 기본 피처: 현재 펀딩비
+        df["funding_rate"] = fr
+
+        # 이동평균 (8회 = ~2.7일, 24회 = ~8일)
+        # 펀딩비는 8h 간격이지만 1h봉에서는 같은 값이 8개씩 반복되므로
+        # rolling은 1h 봉 기준으로 적용 (8봉 = 1회 펀딩비, 64봉 = 8회)
+        df["funding_rate_ma_8"] = fr.rolling(64, min_periods=8).mean()
+        df["funding_rate_ma_24"] = fr.rolling(192, min_periods=24).mean()
+
+        # z-score: (현재 - MA_24) / std_24
+        fr_std = fr.rolling(192, min_periods=24).std().replace(0, np.nan)
+        df["funding_rate_zscore"] = (fr - df["funding_rate_ma_24"]) / fr_std
+
+        # 펀딩비 변화: 현재 vs 이전 (8봉 전 = 이전 펀딩비 정산)
+        df["funding_rate_change"] = fr - fr.shift(8)
+
+        # 연속 양수/음수 횟수 (펀딩비 정산 단위, 부호 변경 시 리셋)
+        # 펀딩비가 실제로 변하는 시점에서만 카운트 (8h 간격)
+        fr_changed = fr != fr.shift(1)
+        fr_unique = fr[fr_changed]  # 실제 펀딩비 변경 시점만 추출
+        sign_unique = np.sign(fr_unique)
+        sign_change = sign_unique != sign_unique.shift(1)
+        streak_groups = sign_change.cumsum()
+        streak_unique = sign_unique.groupby(streak_groups).cumcount() + 1
+        streak_unique = streak_unique * sign_unique
+        # 전체 1h 봉으로 forward fill
+        df["funding_rate_streak"] = streak_unique.reindex(df.index).ffill()
 
         return df
 
