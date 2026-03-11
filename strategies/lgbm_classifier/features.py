@@ -10,6 +10,8 @@
 - 멀티타임프레임 (4h, 1d resample — RSI, MA, ATR, ADX, BB)
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -51,6 +53,7 @@ class FeatureEngine:
         df = self._add_volume_microstructure_features(df)
         df = self._add_time_features(df)
         df = self._add_multitimeframe_features(df)
+        df = self._add_funding_features(df)
 
         self._feature_names = [
             c for c in df.columns
@@ -78,16 +81,16 @@ class FeatureEngine:
             선별된 피처 컬럼 이름 리스트.
         """
         selected = [
-            # 정규화된 MA 비율 (4개)
-            "ma_10_ratio", "ma_30_ratio", "ma_50_ratio", "ma_200_ratio",
+            # 정규화된 MA 비율 (3개 — 원본 모델 기준)
+            "ma_10_ratio", "ma_30_ratio", "ma_200_ratio",
             # 모멘텀 (3개)
             "rsi_14", "macd_hist", "stoch_k",
             # 변동성 (3개)
             "atr_14_pct", "bb_width", "bb_position",
             # 추세 (1개)
             "adx_14",
-            # 가격 파생 (3개)
-            "return_1", "return_5", "return_20",
+            # 가격 파생 (1개)
+            "return_1",
             # 거래량 (1개)
             "volume_ratio",
             # 시간 (2개)
@@ -96,6 +99,8 @@ class FeatureEngine:
             "rsi_14_1d", "ma_50_1d_ratio",
             # 변동성 구조 (2개)
             "vol_ratio_7_30", "return_skew_20",
+            # 펀딩비 (1개 — 극단값 감지)
+            "funding_rate_zscore",
         ]
         return [f for f in selected if f in self._feature_names]
 
@@ -338,6 +343,78 @@ class FeatureEngine:
         if "atr_14_1d" in df.columns:
             atr_1h = self._get_or_compute_atr(df)
             df["atr_ratio_1h_1d"] = atr_1h / df["atr_14_1d"].replace(0, np.nan)
+
+        return df
+
+    # ── 펀딩비 피처 ──────────────────────────────────────────
+
+    def _add_funding_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """펀딩비 파생 피처 생성.
+
+        Bybit 펀딩비는 8시간 간격 (UTC 0:00, 8:00, 16:00).
+        1h 봉에 merge할 때 merge_asof(direction='backward')로
+        현재 시점 이전의 가장 최근 펀딩비만 사용 (look-ahead bias 방지).
+
+        Args:
+            df: OHLCV + 기존 피처가 추가된 데이터프레임.
+
+        Returns:
+            펀딩비 피처가 추가된 데이터프레임.
+        """
+        funding_path = "data/raw/bybit/BTCUSDTUSDT/funding_rate.parquet"
+        if not os.path.exists(funding_path):
+            return df
+
+        funding = pd.read_parquet(funding_path)
+        funding["timestamp"] = pd.to_datetime(funding["timestamp"], utc=True)
+        funding = funding.sort_values("timestamp").reset_index(drop=True)
+
+        # merge_asof: 각 1h 봉에 대해 해당 시점 이전의 가장 최근 펀딩비를 매칭
+        df_ts = pd.to_datetime(df["timestamp"], utc=True)
+        merge_df = pd.DataFrame({"timestamp": df_ts}).reset_index()
+        # timestamp 해상도 통일 (us/ms 불일치 방지)
+        merge_df["timestamp"] = merge_df["timestamp"].astype("datetime64[ns, UTC]")
+        funding_merge = funding[["timestamp", "funding_rate"]].rename(
+            columns={"funding_rate": "_fr"}
+        ).copy()
+        funding_merge["timestamp"] = funding_merge["timestamp"].astype("datetime64[ns, UTC]")
+        merged = pd.merge_asof(
+            merge_df.sort_values("timestamp"),
+            funding_merge,
+            on="timestamp",
+            direction="backward",
+        ).sort_values("index").set_index("index")
+
+        fr = merged["_fr"]
+        fr.index = df.index
+
+        # 기본 피처: 현재 펀딩비
+        df["funding_rate"] = fr
+
+        # 이동평균 (8회 = ~2.7일, 24회 = ~8일)
+        # 펀딩비는 8h 간격이지만 1h봉에서는 같은 값이 8개씩 반복되므로
+        # rolling은 1h 봉 기준으로 적용 (8봉 = 1회 펀딩비, 64봉 = 8회)
+        df["funding_rate_ma_8"] = fr.rolling(64, min_periods=8).mean()
+        df["funding_rate_ma_24"] = fr.rolling(192, min_periods=24).mean()
+
+        # z-score: (현재 - MA_24) / std_24
+        fr_std = fr.rolling(192, min_periods=24).std().replace(0, np.nan)
+        df["funding_rate_zscore"] = (fr - df["funding_rate_ma_24"]) / fr_std
+
+        # 펀딩비 변화: 현재 vs 이전 (8봉 전 = 이전 펀딩비 정산)
+        df["funding_rate_change"] = fr - fr.shift(8)
+
+        # 연속 양수/음수 횟수 (펀딩비 정산 단위, 부호 변경 시 리셋)
+        # 펀딩비가 실제로 변하는 시점에서만 카운트 (8h 간격)
+        fr_changed = fr != fr.shift(1)
+        fr_unique = fr[fr_changed]  # 실제 펀딩비 변경 시점만 추출
+        sign_unique = np.sign(fr_unique)
+        sign_change = sign_unique != sign_unique.shift(1)
+        streak_groups = sign_change.cumsum()
+        streak_unique = sign_unique.groupby(streak_groups).cumcount() + 1
+        streak_unique = streak_unique * sign_unique
+        # 전체 1h 봉으로 forward fill
+        df["funding_rate_streak"] = streak_unique.reindex(df.index).ffill()
 
         return df
 

@@ -1,9 +1,8 @@
-"""OOS(Out-of-Sample) 검증 스크립트.
+"""시뮬레이터 괴리 분석: high/low 기준 vs 종가 기준 SL/TP.
 
-config.yaml과 학습된 모델을 기반으로 구간별 성과를 측정한다.
-Post-Validation 구간에서 성공 기준 충족 여부를 판단한다.
-
-Post-Validation = 선택 fold의 val_end ~ 2026-01-19
+실험 1: 종가 기준 SL/TP (vectorbt 방식)
+실험 2: high/low 기준 SL/TP (oos_validation 방식)
+동일한 신호, 동일한 전체 기간에서 비교.
 """
 
 import json
@@ -17,16 +16,9 @@ import yaml
 from strategies.lgbm_classifier.features import FeatureEngine
 
 
-def load_config():
-    """config.yaml에서 파라미터를 로드."""
-    with open("strategies/lgbm_classifier/config.yaml", "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    return config
-
-
-def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
-                    position_pct=0.05, fee_per_side=0.00055, slippage_per_side=0.0):
-    """포지션 없을 때만 진입, SL/TP로 청산하는 순차 시뮬레이션."""
+def simulate_highlow(df_period, signals_period, sl_pct, tp_pct, max_hold,
+                     position_pct=0.05, fee_per_side=0.00055):
+    """OOS 검증 방식: high/low 기준 SL/TP 체크."""
     close = df_period["close"].values
     high = df_period["high"].values
     low = df_period["low"].values
@@ -81,9 +73,68 @@ def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
 
         i = exit_bar + 1
 
+    return _summarize(trades, position_pct, fee_per_side)
+
+
+def simulate_close_only(df_period, signals_period, sl_pct, tp_pct, max_hold,
+                        position_pct=0.05, fee_per_side=0.00055):
+    """vectorbt 방식: 종가 기준 SL/TP 체크."""
+    close = df_period["close"].values
+    sigs = signals_period.values
+    n = len(close)
+
+    trades = []
+    i = 0
+
+    while i < n:
+        if sigs[i] != 1:
+            i += 1
+            continue
+
+        entry_price = close[i]
+        sl_price = entry_price * (1 - sl_pct)
+        tp_price = entry_price * (1 + tp_pct)
+
+        exit_bar = None
+        exit_return = 0
+        exit_type = "timeout"
+
+        for j in range(i + 1, min(i + 1 + max_hold, n)):
+            # 종가 기준만 체크
+            if close[j] >= tp_price:
+                exit_bar = j
+                exit_return = (close[j] - entry_price) / entry_price
+                exit_type = "tp"
+                break
+            elif close[j] <= sl_price:
+                exit_bar = j
+                exit_return = (close[j] - entry_price) / entry_price
+                exit_type = "sl"
+                break
+
+        if exit_bar is None:
+            exit_bar = min(i + max_hold, n - 1)
+            exit_return = (close[exit_bar] - entry_price) / entry_price
+            exit_type = "timeout"
+
+        trades.append({
+            "entry_bar": i,
+            "exit_bar": exit_bar,
+            "return": exit_return,
+            "type": exit_type,
+            "holding": exit_bar - i,
+        })
+
+        i = exit_bar + 1
+
+    return _summarize(trades, position_pct, fee_per_side)
+
+
+def _summarize(trades, position_pct, fee_per_side):
     if not trades:
         return {"trades": 0, "pf": 0, "total_return": 0, "win_rate": 0,
-                "mdd": 0, "tp_count": 0, "sl_count": 0, "timeout_count": 0}
+                "mdd": 0, "tp_count": 0, "sl_count": 0, "timeout_count": 0,
+                "avg_win": 0, "avg_loss": 0, "trades_detail": []}
 
     returns = np.array([t["return"] for t in trades])
     wins = returns > 0
@@ -91,8 +142,7 @@ def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
     cumulative = 1.0
     equity_curve = [1.0]
     for r in returns:
-        total_cost = 2 * (fee_per_side + slippage_per_side)
-        pnl = position_pct * (r - total_cost)
+        pnl = position_pct * (r - 2 * fee_per_side)
         cumulative *= (1 + pnl)
         equity_curve.append(cumulative)
 
@@ -107,6 +157,9 @@ def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
 
     types = [t["type"] for t in trades]
 
+    avg_win = returns[wins].mean() * 100 if wins.any() else 0
+    avg_loss = returns[~wins].mean() * 100 if (~wins).any() else 0
+
     return {
         "trades": len(trades),
         "win_rate": wins.mean() * 100,
@@ -116,16 +169,19 @@ def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
         "tp_count": types.count("tp"),
         "sl_count": types.count("sl"),
         "timeout_count": types.count("timeout"),
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
     }
 
 
-def run_oos_validation():
-    """OOS 검증을 실행하고 결과를 출력."""
-    config = load_config()
+def main():
+    with open("strategies/lgbm_classifier/config.yaml", "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
     params = config.get("params", {})
     risk = config.get("risk", {})
 
-    CONFIDENCE_THRESHOLD = params.get("confidence_threshold", 0.46)
+    CONFIDENCE_THRESHOLD = params.get("confidence_threshold", 0.48)
     SL_PCT = risk.get("stop_loss_pct", 0.015)
     TP_PCT = risk.get("take_profit_pct", 0.015)
     MAX_HOLD = params.get("max_holding_period", 16)
@@ -134,7 +190,7 @@ def run_oos_validation():
     ENSEMBLE_FOLDS = params.get("ensemble_folds", None)
     MODELS_DIR = params.get("models_dir", "strategies/lgbm_classifier/models")
 
-    # 모델 로드 (앙상블 또는 단일)
+    # 모델 로드
     if ENSEMBLE_FOLDS:
         models = []
         for fold_idx in ENSEMBLE_FOLDS:
@@ -144,16 +200,50 @@ def run_oos_validation():
     else:
         model = lgb.Booster(model_file="strategies/lgbm_classifier/models/latest.txt")
         models = None
-        print("단일 모델 (latest.txt)")
 
     with open("strategies/lgbm_classifier/models/feature_names.json") as f:
         feature_names = json.load(f)
 
-    # 학습 메타 로드
+    # 데이터 & 신호
+    df = pd.read_parquet("data/processed/BTCUSDT_1h_features.parquet")
+    engine = FeatureEngine(config={})
+    df_feat = engine.compute_all_features(df)
+
+    X = df_feat[feature_names]
+    valid_mask = ~X.isna().any(axis=1)
+
+    signals = pd.Series(0, index=df.index, dtype=int)
+
+    if models:
+        preds = [m.predict(X[valid_mask]) for m in models]
+        proba = np.mean(preds, axis=0)
+    else:
+        proba = model.predict(X[valid_mask])
+
+    # 적응형 threshold
+    funding_filter = params.get("funding_filter", {})
+    if funding_filter.get("enabled", False) and "funding_rate_zscore" in df_feat.columns:
+        fr_zscore = df_feat["funding_rate_zscore"].values
+        zscore_thresholds = funding_filter.get("zscore_thresholds", [])
+        adaptive_thr = np.full(len(df), 999.0)
+        for rule in sorted(zscore_thresholds, key=lambda x: x["zscore_below"], reverse=True):
+            mask = fr_zscore < rule["zscore_below"]
+            adaptive_thr[mask] = rule["confidence"]
+        adaptive_thr[np.isnan(fr_zscore)] = CONFIDENCE_THRESHOLD
+        signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
+        print(f"펀딩비 적응형 threshold 적용")
+    else:
+        signals.loc[valid_mask] = np.where(proba >= CONFIDENCE_THRESHOLD, 1, 0)
+
+    print(f"\n전체 신호: 매수={int((signals==1).sum())}, 비매수={int((signals==0).sum())}")
+    print(f"SL: {SL_PCT*100}% / TP: {TP_PCT*100}% / Max Hold: {MAX_HOLD}")
+    print(f"Position: {POSITION_PCT*100}% / Fee: {FEE_PER_SIDE*100}%")
+
+    # 구간 정의
+    ts = pd.to_datetime(df["timestamp"])
     with open("strategies/lgbm_classifier/models/training_meta.json") as f:
         meta = json.load(f)
 
-    # 앙상블일 때 PV 시작점 = 가장 최신 fold의 val_end
     if ENSEMBLE_FOLDS:
         latest_fold = max(ENSEMBLE_FOLDS)
         fm = meta["folds_metrics"][latest_fold]
@@ -163,156 +253,62 @@ def run_oos_validation():
         fm = meta["folds_metrics"][best_fold_idx]
         val_end_str = fm["val_period"].split(" ~ ")[-1].strip()
 
-    # 데이터 로드 & 시그널 생성
-    df = pd.read_parquet("data/processed/BTCUSDT_1h_features.parquet")
-    engine = FeatureEngine(config={})
-    df_feat = engine.compute_all_features(df)
-
-    X = df_feat[feature_names]
-    valid_mask = ~X.isna().any(axis=1)
-
-    signals = pd.Series(0, index=df.index, dtype=int)
-    proba_series = pd.Series(np.nan, index=df.index)
-
-    if models:
-        preds = [m.predict(X[valid_mask]) for m in models]
-        proba = np.mean(preds, axis=0)
-    else:
-        proba = model.predict(X[valid_mask])
-
-    proba_series.loc[valid_mask] = proba
-
-    # 펀딩비 적응형 threshold
-    funding_filter = params.get("funding_filter", {})
-    if funding_filter.get("enabled", False) and "funding_rate_zscore" in df_feat.columns:
-        fr_zscore = df_feat["funding_rate_zscore"].values
-        zscore_thresholds = funding_filter.get("zscore_thresholds", [])
-        # 기본: 최고 threshold 초과 시 차단 (999)
-        adaptive_thr = np.full(len(df), 999.0)
-        # zscore_thresholds를 역순으로 적용 (가장 넓은 범위부터)
-        for rule in sorted(zscore_thresholds, key=lambda x: x["zscore_below"], reverse=True):
-            mask = fr_zscore < rule["zscore_below"]
-            adaptive_thr[mask] = rule["confidence"]
-        # NaN인 구간은 기본 threshold
-        adaptive_thr[np.isnan(fr_zscore)] = CONFIDENCE_THRESHOLD
-        signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
-        print(f"펀딩비 적응형 threshold 적용: {zscore_thresholds}")
-    else:
-        signals.loc[valid_mask] = np.where(proba >= CONFIDENCE_THRESHOLD, 1, 0)
-
-    ts = pd.to_datetime(df["timestamp"])
-
-    # 구간 정의
     val_end_ts = pd.Timestamp(val_end_str)
     if val_end_ts.tzinfo is None:
         val_end_ts = val_end_ts.tz_localize("UTC")
-
     oos_boundary = pd.Timestamp("2026-01-19", tz="UTC")
 
     periods = {
+        "전체 기간": (ts.iloc[0], ts.iloc[-1]),
         "In-Sample": (ts.iloc[0], val_end_ts),
         "Post-Validation": (val_end_ts, oos_boundary),
-        "Strict OOS (2026-01-19~)": (oos_boundary, ts.iloc[-1]),
+        "Strict OOS": (oos_boundary, ts.iloc[-1]),
     }
 
-    # 결과 출력
-    print("=" * 80)
-    print("OOS 검증")
-    print("=" * 80)
-    print(f"confidence_threshold: {CONFIDENCE_THRESHOLD}")
-    print(f"SL: {SL_PCT*100}% / TP: {TP_PCT*100}%")
-    print(f"Max Hold: {MAX_HOLD}")
-    print(f"Post-Val: {val_end_ts} ~ {oos_boundary}")
-    print()
+    # 두 방식 비교
+    print("\n" + "=" * 90)
+    print("시뮬레이터 비교: high/low 기준 vs 종가 기준 SL/TP")
+    print("=" * 90)
 
-    # 시그널 분포
-    print(f"전체 시그널: 매수={int((signals==1).sum())}, 비매수={int((signals==0).sum())}")
-    print()
+    for sim_name, sim_func in [("HIGH/LOW 기준 (OOS방식)", simulate_highlow),
+                                ("종가 기준 (vectorbt방식)", simulate_close_only)]:
+        print(f"\n--- {sim_name} ---")
+        print(f"{'구간':<20} {'거래':>5} {'TP':>4} {'SL':>4} {'TO':>4} "
+              f"{'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7} "
+              f"{'평균승':>7} {'평균패':>7}")
+        print("-" * 90)
 
-    # 시나리오 정의: (이름, slippage_per_side)
-    scenarios = [
-        ("낙관적 (limit)", 0.0005),
-        ("보수적 (taker)", 0.001),
-    ]
-
-    all_scenario_results = {}
-
-    for scenario_name, slippage in scenarios:
-        total_cost_round = 2 * (FEE_PER_SIDE + slippage) * 100
-        print(f"\n{'='*80}")
-        print(f"시나리오: {scenario_name} - 슬리피지 편도 {slippage*100:.2f}%, 왕복 총비용 {total_cost_round:.2f}%")
-        print(f"{'='*80}")
-        print(f"{'구간':<30} {'거래':>5} {'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7}")
-        print("-" * 70)
-
-        results = {}
         for name, (start, end) in periods.items():
             mask = (ts >= start) & (ts < end)
             idx = df.index[mask]
             if len(idx) == 0:
-                print(f"{name:<30} 데이터 없음")
+                print(f"{name:<20} 데이터 없음")
                 continue
-            result = simulate_period(
+
+            result = sim_func(
                 df.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
                 signals.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
                 SL_PCT, TP_PCT, MAX_HOLD, POSITION_PCT, FEE_PER_SIDE,
-                slippage_per_side=slippage,
             )
-            results[name] = result
+
             if result["trades"] == 0:
-                print(f"{name:<30} 거래 없음")
+                print(f"{name:<20} 거래 없음")
                 continue
+
             r = result
-            print(f"{name:<30} {r['trades']:>5} {r['win_rate']:>5.1f}% {r['pf']:>6.2f} "
-                  f"{r['total_return']:>+7.2f}% {r['mdd']:>6.2f}%")
+            print(f"{name:<20} {r['trades']:>5} {r['tp_count']:>4} {r['sl_count']:>4} "
+                  f"{r['timeout_count']:>4} {r['win_rate']:>5.1f}% {r['pf']:>6.2f} "
+                  f"{r['total_return']:>+7.2f}% {r['mdd']:>6.2f}% "
+                  f"{r['avg_win']:>+6.2f}% {r['avg_loss']:>+6.2f}%")
 
-        all_scenario_results[scenario_name] = results
-
-    print()
-
-    # 성공 기준 판단 (보수적 시나리오 기준)
-    conservative = all_scenario_results.get("보수적 (taker)", {})
-    optimistic = all_scenario_results.get("낙관적 (limit)", {})
-
-    is_result = conservative.get("In-Sample", {})
-    pv_result = conservative.get("Post-Validation", {})
-
-    if pv_result.get("trades", 0) == 0:
-        print("FAIL: Post-Validation 구간에 거래가 없습니다 (보수적).")
-        return all_scenario_results
-
-    pv_pf = pv_result["pf"]
-    pv_return = pv_result["total_return"]
-    pv_trades = pv_result["trades"]
-    is_pf = is_result.get("pf", 1.0)
-
-    pf_drop = (is_pf - pv_pf) / is_pf * 100 if is_pf > 0 else 100
-
-    # 거래 수 기준 완화: 25건
-    checks = {
-        "보수적 PV PF >= 1.20": pv_pf >= 1.2,
-        "보수적 PV 수익률 > 0%": pv_return > 0,
-        "PV 거래 수 >= 25": pv_trades >= 25,
-        "PF 하락률 <= 50%": pf_drop <= 50,
-    }
-
-    opt_pv = optimistic.get("Post-Validation", {})
-    opt_pv_pf = opt_pv.get("pf", 0) if opt_pv else 0
-
-    print("--- 성공 기준 (보수적 시나리오 기준) ---")
-    for criterion, passed in checks.items():
-        status = "O" if passed else "X"
-        print(f"  [{status}] {criterion}")
-
-    print(f"\n  IS PF: {is_pf:.2f} → 보수적 PV PF: {pv_pf:.2f} (하락률: {pf_drop:.1f}%)")
-    print(f"  낙관적 PV PF: {opt_pv_pf:.2f}")
-
-    all_passed = all(checks.values())
-    print(f"\n최종 결과: {'SUCCESS' if all_passed else 'FAIL'}")
-    print("=" * 80)
-
-    return all_scenario_results
+    print("\n" + "=" * 90)
+    print("분석 포인트:")
+    print("  1. 동일 신호에서 SL/TP 체크 방식만 다름")
+    print("  2. high/low: 봉 내 고가/저가로 SL/TP hit → 고정 수익/손실")
+    print("  3. 종가: 종가가 SL/TP 가격을 넘어야 청산 → 실제 종가 수익/손실")
+    print("  4. 종가 방식은 SL 슬리피지 발생 (종가 > SL 가격 → 손실 > SL%)")
+    print("=" * 90)
 
 
 if __name__ == "__main__":
-    run_oos_validation()
+    main()

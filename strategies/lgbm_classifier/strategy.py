@@ -56,6 +56,11 @@ class LGBMClassifierStrategy(BaseStrategy):
 
         self.feature_names = self._load_feature_names()
 
+        # 펀딩비 적응형 threshold 설정
+        funding_filter = config.get("funding_filter", {})
+        self.funding_filter_enabled = funding_filter.get("enabled", False)
+        self.zscore_thresholds = funding_filter.get("zscore_thresholds", [])
+
     def generate_signal(self, df: pd.DataFrame) -> int:
         """마지막 봉의 피처로 매매 신호 생성.
 
@@ -73,7 +78,8 @@ class LGBMClassifierStrategy(BaseStrategy):
 
         proba = self._predict(last_row)[0]
 
-        if proba >= self.confidence_threshold:
+        threshold = self._get_adaptive_threshold(df_feat.iloc[-1])
+        if proba >= threshold:
             return 1
         return 0
 
@@ -99,10 +105,42 @@ class LGBMClassifierStrategy(BaseStrategy):
         X_valid = X[valid_mask]
         proba = self._predict(X_valid)
 
-        signal_values = np.where(proba >= self.confidence_threshold, 1, 0)
+        if self.funding_filter_enabled and "funding_rate_zscore" in df_feat.columns:
+            fr_zscore = df_feat["funding_rate_zscore"].values
+            adaptive_thr = np.full(len(df), 999.0)
+            for rule in sorted(self.zscore_thresholds,
+                               key=lambda x: x["zscore_below"], reverse=True):
+                adaptive_thr[fr_zscore < rule["zscore_below"]] = rule["confidence"]
+            adaptive_thr[np.isnan(fr_zscore)] = self.confidence_threshold
+            signal_values = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
+        else:
+            signal_values = np.where(proba >= self.confidence_threshold, 1, 0)
         signals.loc[valid_mask] = signal_values
 
         return signals
+
+    def _get_adaptive_threshold(self, row: pd.Series) -> float:
+        """펀딩비 z-score에 따라 적응형 confidence threshold 반환.
+
+        Args:
+            row: 피처가 포함된 단일 행.
+
+        Returns:
+            해당 봉에 적용할 confidence threshold.
+        """
+        if not self.funding_filter_enabled:
+            return self.confidence_threshold
+
+        zscore = row.get("funding_rate_zscore", np.nan)
+        if np.isnan(zscore):
+            return self.confidence_threshold
+
+        for rule in sorted(self.zscore_thresholds,
+                           key=lambda x: x["zscore_below"]):
+            if zscore < rule["zscore_below"]:
+                return rule["confidence"]
+        # zscore가 모든 threshold 이상이면 차단 (매우 높은 값)
+        return 999.0
 
     def _predict(self, X: pd.DataFrame) -> np.ndarray:
         """모델 예측. 앙상블이면 평균, 단일이면 직접 예측.
