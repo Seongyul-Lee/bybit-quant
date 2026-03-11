@@ -1,0 +1,19 @@
+{
+  "boosting_type": "gbdt",
+  "objective": "binary",
+  "metric": "binary_logloss",
+  "n_estimators": 2000,
+  "bagging_freq": 1,
+  "max_depth": 4,
+  "is_unbalance": false,
+  "verbose": -1,
+  "seed": 42,
+  "deterministic": true,
+  "num_leaves": 26,
+  "min_child_samples": 167,
+  "learning_rate": 0.025889058911773268,
+  "reg_alpha": 1.683313424394024,
+  "reg_lambda": 1.7685557053154952,
+  "feature_fraction": 0.31071455325900305,
+  "bagging_fraction": 0.5006615653895357
+}

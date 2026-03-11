@@ -65,6 +65,10 @@ def main() -> None:
         help="슬라이딩 윈도우 학습 데이터 최대 기간 (월, 기본: 12)"
     )
     parser.add_argument(
+        "--load-params", action="store_true",
+        help="기존 best_params.json에서 하이퍼파라미터 로드 (Optuna 재실행 없이 동일 파라미터 사용)"
+    )
+    parser.add_argument(
         "--exclude-gaps", action="store_true", default=True,
         help="gap fill 구간을 학습에서 제외 (기본: True)"
     )
@@ -99,6 +103,7 @@ def main() -> None:
     else:
         symbol = args.symbol or "BTCUSDT"
         timeframe = args.timeframe or "1h"
+        params_cfg = {}
         logger.warning(f"전략 config 없음: {strategy_config_path} — CLI 인자 사용")
 
     save_dir = f"strategies/{args.strategy}/models"
@@ -125,13 +130,26 @@ def main() -> None:
         feature_names = feature_engine.get_selected_features()
         logger.info(f"선별 피처 사용: {len(feature_names)}개")
 
-    # 2. 라벨 생성
-    logger.info("Triple Barrier 라벨링 시작...")
-    labeler = TripleBarrierLabeler(
-        upper_multiplier=args.upper_barrier,
-        lower_multiplier=args.lower_barrier,
-        max_holding_period=args.max_holding,
-    )
+    # 2. 라벨 생성 (전략별 라벨러 선택)
+    labeler_type = params_cfg.get("labeler_type", "triple_barrier") if 'params_cfg' in locals() else "triple_barrier"
+    if labeler_type == "mean_reversion":
+        from strategies.btc_1h_mean_reversion.labeler import MeanReversionLabeler
+        labeler = MeanReversionLabeler(
+            oversold_bb_threshold=params_cfg.get("oversold_bb_threshold", 0.2),
+            oversold_rsi_threshold=params_cfg.get("oversold_rsi_threshold", 30.0),
+            profit_atr_mult=args.upper_barrier,
+            loss_atr_mult=args.lower_barrier,
+            max_holding_period=args.max_holding,
+            oversold_mode=params_cfg.get("oversold_mode", "or"),
+        )
+        logger.info("MeanReversion 라벨링 시작...")
+    else:
+        labeler = TripleBarrierLabeler(
+            upper_multiplier=args.upper_barrier,
+            lower_multiplier=args.lower_barrier,
+            max_holding_period=args.max_holding,
+        )
+        logger.info("Triple Barrier 라벨링 시작...")
     df["label"] = labeler.generate_labels(df)
 
     # 2.5. Gap 구간 제외 (라벨을 NaN으로 설정 → 아래 NaN 제거에서 자동 제외)
@@ -180,7 +198,19 @@ def main() -> None:
             )
 
     # 3. Walk-Forward 학습
-    n_trials = 0 if args.no_optuna else args.optuna_trials
+    # --load-params: 기존 best_params.json 로드 → Optuna 스킵
+    loaded_params = None
+    if args.load_params:
+        params_path = os.path.join(save_dir, "best_params.json")
+        if os.path.exists(params_path):
+            import json as _json
+            with open(params_path, "r", encoding="utf-8") as f:
+                loaded_params = _json.load(f)
+            logger.info(f"기존 파라미터 로드: {params_path}")
+        else:
+            logger.warning(f"best_params.json 없음: {params_path} — Optuna 실행")
+
+    n_trials = 0 if (args.no_optuna or loaded_params) else args.optuna_trials
     trainer = WalkForwardTrainer(
         min_train_months=args.min_train_months,
         val_months=args.val_months,
@@ -191,7 +221,7 @@ def main() -> None:
     )
 
     logger.info("Walk-Forward 학습 시작...")
-    result = trainer.run(df, feature_names)
+    result = trainer.run(df, feature_names, override_params=loaded_params)
 
     # 4. 과적합 체크 (trainer.run()에서 이미 gap 계산 및 필터링 완료, 여기서는 로그만 보충)
     overfit_count = 0

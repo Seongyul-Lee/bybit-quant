@@ -33,6 +33,7 @@ argument-hint: "[선택사항: 특정 verify 스킬 이름]"
 | 2 | `verify-risk` | 리스크 관리 규칙 준수 여부 검증 |
 | 3 | `verify-data-safety` | 데이터 안전성 규칙 검증 |
 | 4 | `verify-ml` | ML 전략(LightGBM) 전용 규칙 검증 |
+| 5 | `verify-portfolio` | 포트폴리오 레이어(자본 배분, 리스크, 가상 포지션) 규칙 검증 |
 
 ## 워크플로우
 

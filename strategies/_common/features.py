@@ -56,6 +56,7 @@ class FeatureEngine:
         df = self._add_time_features(df)
         df = self._add_multitimeframe_features(df)
         df = self._add_funding_features(df)
+        df = self._add_open_interest_features(df)
 
         self._feature_names = [
             c for c in df.columns
@@ -423,6 +424,77 @@ class FeatureEngine:
         streak_unique = streak_unique * sign_unique
         # 전체 1h 봉으로 forward fill
         df["funding_rate_streak"] = streak_unique.reindex(df.index).ffill()
+
+        return df
+
+    # ── 미결제약정 피처 ────────────────────────────────────────
+
+    def _add_open_interest_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """미결제약정(OI) 파생 피처 생성.
+
+        OI는 1h 간격 — OHLCV와 동일 타임프레임.
+        merge_asof(direction='backward')로 look-ahead bias 방지.
+
+        Args:
+            df: OHLCV + 기존 피처가 추가된 데이터프레임.
+
+        Returns:
+            OI 피처가 추가된 데이터프레임. 파일 미존재 시 df 그대로 반환.
+        """
+        # 심볼에서 OI 파일 경로 생성
+        clean_symbol = self.symbol.replace("/", "").replace(":", "")
+        if not clean_symbol.endswith("USDT"):
+            clean_symbol = clean_symbol + "USDT"
+        elif clean_symbol.count("USDT") == 1:
+            clean_symbol = clean_symbol + "USDT"
+        oi_path = f"data/raw/bybit/{clean_symbol}/open_interest_1h.parquet"
+        if not os.path.exists(oi_path):
+            return df
+
+        oi = pd.read_parquet(oi_path)
+        oi["timestamp"] = pd.to_datetime(oi["timestamp"], utc=True)
+        oi = oi.sort_values("timestamp").reset_index(drop=True)
+
+        # merge_asof: 각 1h 봉에 대해 해당 시점 이전의 가장 최근 OI를 매칭
+        df_ts = pd.to_datetime(df["timestamp"], utc=True)
+        merge_df = pd.DataFrame({"timestamp": df_ts}).reset_index()
+        merge_df["timestamp"] = merge_df["timestamp"].astype("datetime64[ns, UTC]")
+
+        oi_merge = oi[["timestamp", "open_interest_amount"]].rename(
+            columns={"open_interest_amount": "_oi_value"}
+        ).copy()
+        oi_merge["timestamp"] = oi_merge["timestamp"].astype("datetime64[ns, UTC]")
+
+        merged = pd.merge_asof(
+            merge_df.sort_values("timestamp"),
+            oi_merge,
+            on="timestamp",
+            direction="backward",
+            tolerance=pd.Timedelta("5min"),
+        ).sort_values("index").set_index("index")
+
+        oi_series = merged["_oi_value"]
+        oi_series.index = df.index
+
+        # 1) OI MA ratio: OI / MA(48) — 최근 OI가 평균 대비 높은지
+        oi_ma_48 = oi_series.rolling(48, min_periods=12).mean()
+        df["oi_ma_ratio"] = oi_series / oi_ma_48.replace(0, np.nan)
+
+        # 2) OI 1시간 변화율
+        df["oi_change_1h"] = oi_series.pct_change(1)
+
+        # 3) OI 24시간 변화율
+        df["oi_change_24h"] = oi_series.pct_change(24)
+
+        # 4) OI z-score: (OI - MA_168) / std_168 (7일)
+        oi_ma_168 = oi_series.rolling(168, min_periods=48).mean()
+        oi_std_168 = oi_series.rolling(168, min_periods=48).std().replace(0, np.nan)
+        df["oi_zscore"] = (oi_series - oi_ma_168) / oi_std_168
+
+        # 5) OI-가격 다이버전스 (24h)
+        price_change = df["close"].pct_change(24)
+        oi_change = oi_series.pct_change(24)
+        df["oi_price_divergence"] = price_change * oi_change
 
         return df
 

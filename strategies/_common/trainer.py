@@ -255,6 +255,7 @@ class WalkForwardTrainer:
         df: pd.DataFrame,
         feature_names: list[str],
         label_col: str = "label",
+        override_params: dict | None = None,
     ) -> dict:
         """전체 Walk-Forward 학습 파이프라인 실행.
 
@@ -280,7 +281,10 @@ class WalkForwardTrainer:
         X_val_0 = df.loc[first_fold["val_idx"], feature_names]
         y_val_0 = df.loc[first_fold["val_idx"], label_col]
 
-        if self.n_optuna_trials > 0:
+        if override_params:
+            best_params = {**self.FIXED_PARAMS, **override_params}
+            logger.info(f"외부 파라미터 사용: {len(override_params)}개 키")
+        elif self.n_optuna_trials > 0:
             logger.info(f"Fold 0: Optuna 튜닝 ({self.n_optuna_trials} trials)...")
             best_params = self.optimize_hyperparams(X_train_0, y_train_0, X_val_0, y_val_0)
         else:

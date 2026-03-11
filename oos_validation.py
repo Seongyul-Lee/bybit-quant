@@ -210,18 +210,26 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
     if funding_filter.get("enabled", False) and "funding_rate_zscore" in df_feat.columns:
         fr_zscore = df_feat["funding_rate_zscore"].values
         zscore_thresholds = funding_filter.get("zscore_thresholds", [])
-        # 기본: 최고 threshold 초과 시 차단 (999)
         adaptive_thr = np.full(len(df), 999.0)
-        # zscore_thresholds를 역순으로 적용 (가장 넓은 범위부터)
         for rule in sorted(zscore_thresholds, key=lambda x: x["zscore_below"], reverse=True):
             mask = fr_zscore < rule["zscore_below"]
             adaptive_thr[mask] = rule["confidence"]
-        # NaN인 구간은 기본 threshold
         adaptive_thr[np.isnan(fr_zscore)] = CONFIDENCE_THRESHOLD
-        signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
         print(f"펀딩비 적응형 threshold 적용: {zscore_thresholds}")
     else:
-        signals.loc[valid_mask] = np.where(proba >= CONFIDENCE_THRESHOLD, 1, 0)
+        adaptive_thr = np.full(len(df), CONFIDENCE_THRESHOLD)
+
+    # OI 필터
+    oi_filter = params.get("oi_filter", {})
+    if oi_filter.get("enabled", False) and "oi_zscore" in df_feat.columns:
+        oi_block = oi_filter.get("block_zscore")
+        if oi_block is not None:
+            oi_z = df_feat["oi_zscore"].values
+            block_mask = (oi_z >= oi_block) & ~np.isnan(oi_z)
+            adaptive_thr[block_mask] = 999.0
+            print(f"OI 필터 적용: block_zscore >= {oi_block}")
+
+    signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
 
     ts = pd.to_datetime(df["timestamp"])
 
@@ -302,7 +310,10 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
 
     if pv_result.get("trades", 0) == 0:
         print("FAIL: Post-Validation 구간에 거래가 없습니다 (보수적).")
-        return all_scenario_results
+        return all_scenario_results, {
+            "passed": False, "conservative": {"pv_pf": 0, "pv_return": 0, "pv_trades": 0},
+            "strict_oos": {},
+        }
 
     pv_pf = pv_result["pf"]
     pv_return = pv_result["total_return"]
@@ -334,12 +345,44 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
     print(f"\n최종 결과: {'SUCCESS' if all_passed else 'FAIL'}")
     print("=" * 80)
 
-    return all_scenario_results
+    # 구조화된 결과 (프로그래밍 API용)
+    structured = {
+        "passed": all_passed,
+        "conservative": {
+            "is_pf": is_pf,
+            "pv_pf": pv_pf,
+            "pv_return": pv_return,
+            "pv_trades": pv_trades,
+            "pf_drop": pf_drop,
+        },
+        "strict_oos": {},
+    }
+
+    strict_result = conservative.get("Strict OOS (2026-01-19~)", {})
+    if strict_result:
+        structured["strict_oos"] = {
+            "pf": strict_result.get("pf", 0),
+            "trades": strict_result.get("trades", 0),
+            "total_return": strict_result.get("total_return", 0),
+        }
+
+    return all_scenario_results, structured
 
 
 if __name__ == "__main__":
+    import json as _json
+
     parser = argparse.ArgumentParser(description="OOS 검증")
     parser.add_argument("--strategy", type=str, default="btc_1h_momentum",
                         help="전략 이름 (기본: btc_1h_momentum)")
+    parser.add_argument("--json", action="store_true",
+                        help="JSON 형식으로 결과 출력")
     args = parser.parse_args()
-    run_oos_validation(strategy_name=args.strategy)
+    result = run_oos_validation(strategy_name=args.strategy)
+
+    if args.json and isinstance(result, tuple) and len(result) == 2:
+        _, structured = result
+        print("\n__JSON_RESULT__")
+        print(_json.dumps(structured, ensure_ascii=False))
+    elif isinstance(result, tuple):
+        pass  # 일반 출력 이미 완료

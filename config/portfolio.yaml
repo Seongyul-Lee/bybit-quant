@@ -4,6 +4,7 @@ portfolio:
   active_strategies:
     - btc_1h_momentum
     - eth_1h_momentum
+    - btc_1h_mean_reversion
 
   allocation:
     mode: equal

@@ -34,6 +34,7 @@ argument-hint: "[선택사항: 특정 스킬 이름 또는 집중할 영역]"
 | `verify-risk` | 리스크 관리 규칙 준수 여부 검증 | `src/risk/`, `config/risk_params.yaml`, `main.py` |
 | `verify-data-safety` | 데이터 안전성 규칙 검증 | `src/execution/`, `config/`, `reports/trades/` |
 | `verify-ml` | ML 전략(LightGBM) 전용 규칙 검증 | `strategies/lgbm_classifier/`, `train_lgbm.py`, `main.py` |
+| `verify-portfolio` | 포트폴리오 레이어(자본 배분, 리스크, 가상 포지션) 규칙 검증 | `src/portfolio/`, `config/portfolio.yaml`, `main.py` |
 
 ## 워크플로우
 

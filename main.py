@@ -40,6 +40,9 @@ def load_strategy(strategy_name: str):
     elif strategy_name == "eth_1h_momentum":
         from strategies.eth_1h_momentum.strategy import LGBMClassifierStrategy as ETHStrategy
         return ETHStrategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_mean_reversion":
+        from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
+        return MeanReversionStrategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 
