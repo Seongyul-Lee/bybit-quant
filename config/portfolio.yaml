@@ -3,6 +3,7 @@
 portfolio:
   active_strategies:
     - btc_1h_momentum
+    - eth_1h_momentum
 
   allocation:
     mode: equal

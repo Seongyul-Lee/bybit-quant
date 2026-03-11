@@ -1,0 +1,31 @@
+strategy:
+  name: eth_1h_momentum
+  type: lgbm_binary
+  symbol: ETHUSDT
+  timeframe: 1h
+
+params:
+  model_path: strategies/eth_1h_momentum/models/latest.txt
+  feature_names_path: strategies/eth_1h_momentum/models/feature_names.json
+  confidence_threshold: 0.44
+  upper_barrier_multiplier: 3.0
+  lower_barrier_multiplier: 3.0
+  max_holding_period: 24
+  ensemble_folds: [12, 14]
+  models_dir: strategies/eth_1h_momentum/models
+  funding_filter:
+    enabled: true
+    zscore_thresholds:
+      - {zscore_below: 0, confidence: 0.42}
+      - {zscore_below: 2, confidence: 0.44}
+      # zscore >= 2 이면 진입 차단
+
+execution:
+  order_type: limit
+  limit_offset: 0.001
+  fee_rate: 0.00055
+
+risk:
+  max_position_pct: 0.20
+  stop_loss_pct: 0.021
+  take_profit_pct: 0.021

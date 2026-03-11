@@ -1,0 +1,2 @@
+# LightGBM 모델 파일은 binary로 처리 (CRLF 변환 방지)
+strategies/**/models/*.txt binary

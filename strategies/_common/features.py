@@ -31,9 +31,11 @@ class FeatureEngine:
 
         Args:
             config: 피처 설정 (ma_periods, rsi_period 등).
+                    symbol: 심볼 (예: "BTCUSDT"). 펀딩비 경로 결정에 사용.
         """
         self.config = config
         self._feature_names: list[str] = []
+        self.symbol: str = config.get("symbol", "BTCUSDT")
 
     def compute_all_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """모든 피처 그룹을 계산하여 데이터프레임에 추가.
@@ -361,7 +363,13 @@ class FeatureEngine:
         Returns:
             펀딩비 피처가 추가된 데이터프레임.
         """
-        funding_path = "data/raw/bybit/BTCUSDTUSDT/funding_rate.parquet"
+        # 심볼에서 펀딩비 파일 경로 생성 (BTCUSDT → BTCUSDTUSDT)
+        clean_symbol = self.symbol.replace("/", "").replace(":", "")
+        if not clean_symbol.endswith("USDT"):
+            clean_symbol = clean_symbol + "USDT"
+        elif clean_symbol.count("USDT") == 1:
+            clean_symbol = clean_symbol + "USDT"
+        funding_path = f"data/raw/bybit/{clean_symbol}/funding_rate.parquet"
         if not os.path.exists(funding_path):
             return df
 
