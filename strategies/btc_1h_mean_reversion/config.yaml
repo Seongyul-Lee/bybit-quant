@@ -1,0 +1,40 @@
+strategy:
+  name: btc_1h_mean_reversion
+  symbol: BTCUSDT
+  timeframe: 1h
+
+params:
+  model_path: strategies/btc_1h_mean_reversion/models/latest.txt
+  feature_names_path: strategies/btc_1h_mean_reversion/models/feature_names.json
+  confidence_threshold: 0.50
+  upper_barrier_multiplier: 2.5
+  lower_barrier_multiplier: 3.0
+  max_holding_period: 24
+  models_dir: strategies/btc_1h_mean_reversion/models
+
+  # 평균회귀 라벨러 파라미터
+  labeler_type: mean_reversion
+  oversold_bb_threshold: 0.2
+  oversold_rsi_threshold: 30.0
+  oversold_mode: "or"
+
+  funding_filter:
+    enabled: true
+    zscore_thresholds:
+      - {zscore_below: 0, confidence: 0.48}
+      - {zscore_below: 2, confidence: 0.50}
+      # zscore >= 2 이면 진입 차단
+
+  oi_filter:
+    enabled: true
+    block_zscore: 1.0  # OI zscore >= 1.0 이면 진입 차단 (과밀 포지션)
+
+execution:
+  order_type: limit
+  limit_offset: 0.001
+  fee_rate: 0.00055
+
+risk:
+  max_position_pct: 0.20
+  stop_loss_pct: 0.021
+  take_profit_pct: 0.020

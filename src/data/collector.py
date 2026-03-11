@@ -213,6 +213,92 @@ class BybitDataCollector:
         logger.info(f"펀딩비 대량 수집 완료: {symbol} ({len(result)}건)")
         return result
 
+    def fetch_open_interest_bulk(
+        self,
+        symbol: str = "BTC/USDT:USDT",
+        timeframe: str = "1h",
+        since: str = "2024-01-01T00:00:00Z",
+        sleep_sec: float = 0.5,
+    ) -> pd.DataFrame:
+        """대량 미결제약정 이력을 페이지네이션으로 수집.
+
+        ccxt의 fetch_open_interest_history()는 since를 무시하고 최신 200건만
+        반환하므로, Bybit V5 API를 직접 호출하여 endTime 역순 페이지네이션.
+        API는 역순(최신→과거) 반환하므로 endTime을 점점 과거로 이동.
+
+        Args:
+            symbol: 거래 심볼 (예: "BTC/USDT:USDT").
+            timeframe: OI 간격 (1h 권장 — OHLCV와 동일 타임프레임).
+            since: 수집 시작 시점 ISO 8601 문자열.
+            sleep_sec: 요청 간 대기 시간 (초). Rate limit 준수용.
+
+        Returns:
+            미결제약정 데이터프레임 (timestamp, open_interest_amount).
+        """
+        all_data: list[pd.DataFrame] = []
+        since_ts = self.exchange.parse8601(since)
+        end_ts = int(datetime.utcnow().timestamp() * 1000)
+        timeframe_ms = self._timeframe_to_ms(timeframe)
+        # ccxt 심볼 → Bybit API 심볼 변환 (BTC/USDT:USDT → BTCUSDT)
+        api_symbol = symbol.replace("/", "").replace(":USDT", "")
+
+        # V5 intervalTime 매핑
+        interval_map = {"5m": "5min", "15m": "15min", "30m": "30min",
+                        "1h": "1h", "4h": "4h", "1d": "1D"}
+        interval_time = interval_map.get(timeframe, timeframe)
+
+        page_count = 0
+        while end_ts > since_ts:
+            resp = self.exchange.publicGetV5MarketOpenInterest({
+                "category": "linear",
+                "symbol": api_symbol,
+                "intervalTime": interval_time,
+                "limit": "200",
+                "endTime": str(end_ts),
+            })
+            rows = resp.get("result", {}).get("list", [])
+            if not rows:
+                break
+
+            records = [
+                {
+                    "timestamp": int(r["timestamp"]),
+                    "open_interest_amount": float(r["openInterest"]),
+                }
+                for r in rows
+            ]
+            all_data.append(pd.DataFrame(records))
+
+            # 역순이므로 마지막(가장 과거) row의 timestamp에서 1봉 전으로 이동
+            oldest_ts = min(int(r["timestamp"]) for r in rows)
+            end_ts = oldest_ts - timeframe_ms
+
+            page_count += 1
+            if page_count % 20 == 0:
+                logger.info(f"OI 수집 진행: {page_count}페이지, "
+                            f"현재 {datetime.utcfromtimestamp(oldest_ts/1000).strftime('%Y-%m-%d')}")
+
+            if len(rows) < 200:
+                break
+
+            time.sleep(sleep_sec)
+
+        if not all_data:
+            return pd.DataFrame(columns=["timestamp", "open_interest_amount"])
+
+        result = pd.concat(all_data, ignore_index=True)
+        result["timestamp"] = pd.to_datetime(result["timestamp"], unit="ms", utc=True)
+        # since 이전 데이터 제거
+        since_dt = pd.Timestamp(since, tz="UTC")
+        result = result[result["timestamp"] >= since_dt]
+        result = (
+            result.drop_duplicates(subset=["timestamp"])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        logger.info(f"OI 대량 수집 완료: {symbol} {timeframe} ({len(result)}건, {page_count}페이지)")
+        return result
+
     def save_ohlcv(self, df: pd.DataFrame, symbol: str, timeframe: str) -> list[str]:
         """OHLCV 데이터를 월별 Parquet 파일로 저장.
 

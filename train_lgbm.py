@@ -99,6 +99,7 @@ def main() -> None:
     else:
         symbol = args.symbol or "BTCUSDT"
         timeframe = args.timeframe or "1h"
+        params_cfg = {}
         logger.warning(f"전략 config 없음: {strategy_config_path} — CLI 인자 사용")
 
     save_dir = f"strategies/{args.strategy}/models"
@@ -125,13 +126,26 @@ def main() -> None:
         feature_names = feature_engine.get_selected_features()
         logger.info(f"선별 피처 사용: {len(feature_names)}개")
 
-    # 2. 라벨 생성
-    logger.info("Triple Barrier 라벨링 시작...")
-    labeler = TripleBarrierLabeler(
-        upper_multiplier=args.upper_barrier,
-        lower_multiplier=args.lower_barrier,
-        max_holding_period=args.max_holding,
-    )
+    # 2. 라벨 생성 (전략별 라벨러 선택)
+    labeler_type = params_cfg.get("labeler_type", "triple_barrier") if 'params_cfg' in locals() else "triple_barrier"
+    if labeler_type == "mean_reversion":
+        from strategies.btc_1h_mean_reversion.labeler import MeanReversionLabeler
+        labeler = MeanReversionLabeler(
+            oversold_bb_threshold=params_cfg.get("oversold_bb_threshold", 0.2),
+            oversold_rsi_threshold=params_cfg.get("oversold_rsi_threshold", 30.0),
+            profit_atr_mult=args.upper_barrier,
+            loss_atr_mult=args.lower_barrier,
+            max_holding_period=args.max_holding,
+            oversold_mode=params_cfg.get("oversold_mode", "or"),
+        )
+        logger.info("MeanReversion 라벨링 시작...")
+    else:
+        labeler = TripleBarrierLabeler(
+            upper_multiplier=args.upper_barrier,
+            lower_multiplier=args.lower_barrier,
+            max_holding_period=args.max_holding,
+        )
+        logger.info("Triple Barrier 라벨링 시작...")
     df["label"] = labeler.generate_labels(df)
 
     # 2.5. Gap 구간 제외 (라벨을 NaN으로 설정 → 아래 NaN 제거에서 자동 제외)
