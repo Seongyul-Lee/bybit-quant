@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategies.base import BaseStrategy
-from strategies.lgbm_classifier.features import FeatureEngine
+from strategies._common.features import FeatureEngine
 
 
 class LGBMClassifierStrategy(BaseStrategy):
@@ -30,7 +30,7 @@ class LGBMClassifierStrategy(BaseStrategy):
         feature_names_path: 피처 이름 JSON 경로.
         confidence_threshold: 최소 확률 임계값 (기본 0.5).
         ensemble_folds: 앙상블에 사용할 fold 인덱스 리스트 (기본: None → 단일 모델).
-        models_dir: fold 모델이 저장된 디렉토리 (기본: strategies/lgbm_classifier/models).
+        models_dir: fold 모델이 저장된 디렉토리 (기본: strategies/btc_1h_momentum/models).
     """
 
     def __init__(self, config: dict) -> None:
@@ -44,7 +44,7 @@ class LGBMClassifierStrategy(BaseStrategy):
         self.confidence_threshold = config.get("confidence_threshold", 0.5)
         self.ensemble_folds = config.get("ensemble_folds", None)
         self.models_dir = config.get(
-            "models_dir", "strategies/lgbm_classifier/models"
+            "models_dir", "strategies/btc_1h_momentum/models"
         )
 
         if self.ensemble_folds:
@@ -61,36 +61,40 @@ class LGBMClassifierStrategy(BaseStrategy):
         self.funding_filter_enabled = funding_filter.get("enabled", False)
         self.zscore_thresholds = funding_filter.get("zscore_thresholds", [])
 
-    def generate_signal(self, df: pd.DataFrame) -> int:
+    def generate_signal(self, df: pd.DataFrame) -> tuple[int, float]:
         """마지막 봉의 피처로 매매 신호 생성.
 
         Args:
             df: OHLCV + 피처 데이터프레임.
 
         Returns:
-            1(매수) 또는 0(비매수).
+            (signal, probability) 튜플.
+            signal: 1(매수) 또는 0(비매수).
+            probability: 매수 확률 (0.0 ~ 1.0).
         """
         df_feat = self.feature_engine.compute_all_features(df)
         last_row = df_feat[self.feature_names].iloc[[-1]]
 
         if last_row.isna().any(axis=1).iloc[0]:
-            return 0
+            return 0, 0.0
 
         proba = self._predict(last_row)[0]
 
         threshold = self._get_adaptive_threshold(df_feat.iloc[-1])
         if proba >= threshold:
-            return 1
-        return 0
+            return 1, float(proba)
+        return 0, float(proba)
 
-    def generate_signals_vectorized(self, df: pd.DataFrame) -> pd.Series:
+    def generate_signals_vectorized(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         """전체 데이터에 대해 벡터화 신호 생성 (백테스트 전용).
 
         Args:
             df: OHLCV + 피처 데이터프레임.
 
         Returns:
-            신호 시리즈 (1=매수, 0=비매수).
+            (signal_series, probability_series) 튜플.
+            signal_series: 신호 시리즈 (1=매수, 0=비매수).
+            probability_series: 매수 확률 시리즈.
         """
         df_feat = self.feature_engine.compute_all_features(df)
 
@@ -98,12 +102,14 @@ class LGBMClassifierStrategy(BaseStrategy):
         valid_mask = ~X.isna().any(axis=1)
 
         signals = pd.Series(0, index=df.index, dtype=int)
+        probabilities = pd.Series(0.0, index=df.index, dtype=float)
 
         if valid_mask.sum() == 0:
-            return signals
+            return signals, probabilities
 
         X_valid = X[valid_mask]
         proba = self._predict(X_valid)
+        probabilities.loc[valid_mask] = proba
 
         if self.funding_filter_enabled and "funding_rate_zscore" in df_feat.columns:
             fr_zscore = df_feat["funding_rate_zscore"].values
@@ -117,7 +123,7 @@ class LGBMClassifierStrategy(BaseStrategy):
             signal_values = np.where(proba >= self.confidence_threshold, 1, 0)
         signals.loc[valid_mask] = signal_values
 
-        return signals
+        return signals, probabilities
 
     def _get_adaptive_threshold(self, row: pd.Series) -> float:
         """펀딩비 z-score에 따라 적응형 confidence threshold 반환.
@@ -167,7 +173,7 @@ class LGBMClassifierStrategy(BaseStrategy):
         """
         model_path = self.config.get(
             "model_path",
-            "strategies/lgbm_classifier/models/latest.txt",
+            "strategies/btc_1h_momentum/models/latest.txt",
         )
 
         if not os.path.exists(model_path):
@@ -209,7 +215,7 @@ class LGBMClassifierStrategy(BaseStrategy):
         """
         path = self.config.get(
             "feature_names_path",
-            "strategies/lgbm_classifier/models/feature_names.json",
+            "strategies/btc_1h_momentum/models/feature_names.json",
         )
 
         if not os.path.exists(path):

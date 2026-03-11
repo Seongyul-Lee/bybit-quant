@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategies.lgbm_classifier.trainer import WalkForwardTrainer
+from strategies._common.trainer import WalkForwardTrainer
 
 
 @pytest.fixture

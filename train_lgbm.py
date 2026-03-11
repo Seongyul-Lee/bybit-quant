@@ -16,10 +16,10 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from src.utils.logger import setup_logger
-from strategies.lgbm_classifier.features import FeatureEngine
-from strategies.lgbm_classifier.labeler import TripleBarrierLabeler
-from strategies.lgbm_classifier.trainer import WalkForwardTrainer
-from strategies.lgbm_classifier.evaluator import ModelEvaluator
+from strategies._common.features import FeatureEngine
+from strategies._common.labeler import TripleBarrierLabeler
+from strategies._common.trainer import WalkForwardTrainer
+from strategies._common.evaluator import ModelEvaluator
 
 logger = setup_logger("train_lgbm")
 
@@ -184,7 +184,7 @@ def main() -> None:
         logger.warning(f"전체 {total_folds}개 fold가 과적합. 피처/하이퍼파라미터 재검토 필요.")
 
     # 5. 모델 저장
-    save_dir = "strategies/lgbm_classifier/models"
+    save_dir = "strategies/btc_1h_momentum/models"
     model_path = trainer.save_model(
         model=result["model"],
         params=result["params"],

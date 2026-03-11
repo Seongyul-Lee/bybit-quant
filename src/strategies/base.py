@@ -17,6 +17,9 @@ class BaseStrategy(ABC):
 
     Attributes:
         config: 전략 파라미터 딕셔너리.
+        strategy_name: 전략 이름.
+        symbol: 거래 심볼.
+        timeframe: 타임프레임.
     """
 
     def __init__(self, config: dict) -> None:
@@ -26,19 +29,34 @@ class BaseStrategy(ABC):
             config: 전략 설정 딕셔너리 (파라미터, 심볼, 타임프레임 등).
         """
         self.config = config
+        self.strategy_name: str = config.get("strategy_name", "unknown")
+        self.symbol: str = config.get("symbol", "BTCUSDT")
+        self.timeframe: str = config.get("timeframe", "1h")
 
     @abstractmethod
-    def generate_signal(self, df: pd.DataFrame) -> int:
-        """현재 데이터를 기반으로 매매 신호 생성.
+    def generate_signal(self, df: pd.DataFrame) -> tuple[int, float]:
+        """매매 신호 + 확신도를 반환.
 
         Args:
             df: OHLCV + 피처 데이터프레임.
                 최소 컬럼: timestamp, open, high, low, close, volume.
 
         Returns:
-            1  = 매수 신호 (Long)
-            -1 = 매도 신호 (Short)
-            0  = 중립 (포지션 없음)
+            (signal, probability) 튜플.
+            signal: 1(매수) 또는 0(비매수).
+            probability: 매수 확률 (0.0 ~ 1.0). 자본 배분에 활용.
+        """
+        pass
+
+    @abstractmethod
+    def generate_signals_vectorized(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        """벡터화 신호 + 확신도 시리즈 반환 (백테스트 전용).
+
+        Args:
+            df: OHLCV + 피처 데이터프레임.
+
+        Returns:
+            (signal_series, probability_series) 튜플.
         """
         pass
 

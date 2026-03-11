@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from strategies.lgbm_classifier.strategy import LGBMClassifierStrategy
+from strategies.btc_1h_momentum.strategy import LGBMClassifierStrategy
 
 
 @pytest.fixture
@@ -79,9 +79,10 @@ class TestLGBMClassifierStrategy:
         # mock 모델이 낮은 매수 확률을 반환 → 비매수
         strategy.model.predict.return_value = np.array([0.3])
 
-        signal = strategy.generate_signal(sample_ohlcv)
+        signal, prob = strategy.generate_signal(sample_ohlcv)
         assert isinstance(signal, (int, np.integer))
         assert signal in {0, 1}
+        assert isinstance(prob, float)
 
     def test_generate_signal_buy(
         self, sample_ohlcv: pd.DataFrame, mock_model_files: dict
@@ -91,7 +92,7 @@ class TestLGBMClassifierStrategy:
         # 매수 확률 0.7 >= threshold 0.5 → 매수
         strategy.model.predict.return_value = np.array([0.7])
 
-        signal = strategy.generate_signal(sample_ohlcv)
+        signal, prob = strategy.generate_signal(sample_ohlcv)
         assert signal == 1
 
     def test_generate_signal_non_buy(
@@ -102,7 +103,7 @@ class TestLGBMClassifierStrategy:
         # 매수 확률 0.3 < threshold 0.5 → 비매수
         strategy.model.predict.return_value = np.array([0.3])
 
-        signal = strategy.generate_signal(sample_ohlcv)
+        signal, prob = strategy.generate_signal(sample_ohlcv)
         assert signal == 0
 
     def test_generate_signal_neutral_below_threshold(
@@ -113,7 +114,7 @@ class TestLGBMClassifierStrategy:
         # 매수 확률 0.4 < 0.5 → 비매수
         strategy.model.predict.return_value = np.array([0.4])
 
-        signal = strategy.generate_signal(sample_ohlcv)
+        signal, prob = strategy.generate_signal(sample_ohlcv)
         assert signal == 0
 
     def test_generate_signals_vectorized_returns_series(
@@ -128,8 +129,9 @@ class TestLGBMClassifierStrategy:
 
         strategy.model.predict.side_effect = dynamic_predict
 
-        signals = strategy.generate_signals_vectorized(sample_ohlcv)
+        signals, probs = strategy.generate_signals_vectorized(sample_ohlcv)
         assert isinstance(signals, pd.Series)
+        assert isinstance(probs, pd.Series)
         assert len(signals) == len(sample_ohlcv)
         assert set(signals.unique()).issubset({0, 1})
 
@@ -144,7 +146,7 @@ class TestLGBMClassifierStrategy:
 
         strategy.model.predict.side_effect = dynamic_predict
 
-        signals = strategy.generate_signals_vectorized(sample_ohlcv)
+        signals, probs = strategy.generate_signals_vectorized(sample_ohlcv)
         assert (signals == 0).all()
 
     def test_get_params_returns_config(self, mock_model_files: dict) -> None:
@@ -192,7 +194,7 @@ class TestLGBMClassifierStrategy:
         strategy.model.predict.side_effect = deterministic_predict
 
         # 벡터화 신호 생성
-        vec_signals = strategy.generate_signals_vectorized(sample_ohlcv)
+        vec_signals, vec_probs = strategy.generate_signals_vectorized(sample_ohlcv)
 
         # 순차 신호 생성 (warmup 200봉 이후부터 비교)
         warmup = 200
@@ -200,7 +202,7 @@ class TestLGBMClassifierStrategy:
         total_compared = 0
 
         for i in range(warmup, len(sample_ohlcv)):
-            seq_signal = strategy.generate_signal(sample_ohlcv.iloc[: i + 1])
+            seq_signal, _ = strategy.generate_signal(sample_ohlcv.iloc[: i + 1])
             if vec_signals.iloc[i] != seq_signal:
                 mismatches += 1
             total_compared += 1

@@ -33,11 +33,8 @@ def load_strategy(strategy_name: str):
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    if strategy_name == "ma_crossover":
-        from strategies.ma_crossover.strategy import MACrossoverStrategy
-        return MACrossoverStrategy(config=config.get("params", {}))
-    elif strategy_name == "lgbm_classifier":
-        from strategies.lgbm_classifier.strategy import LGBMClassifierStrategy
+    if strategy_name == "btc_1h_momentum":
+        from strategies.btc_1h_momentum.strategy import LGBMClassifierStrategy
         return LGBMClassifierStrategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
@@ -236,7 +233,7 @@ def run_live(strategy_name: str) -> None:
                         logger.warning(f"청산 PnL 조회 실패: {e}")
 
             # 3. 신호 생성
-            signal = strategy.generate_signal(df)
+            signal, prob = strategy.generate_signal(df)
 
             if signal == 0:
                 logger.info("신호: 중립 — 대기")
@@ -414,12 +411,12 @@ def run_backtest(strategy_name: str) -> None:
 
     # 신호 생성 (벡터화 우선, fallback으로 루프)
     if hasattr(strategy, "generate_signals_vectorized"):
-        signal_series = strategy.generate_signals_vectorized(df)
+        signal_series, prob_series = strategy.generate_signals_vectorized(df)
         logger.info("벡터화 신호 생성 사용")
     else:
         signals = []
         for i in range(len(df)):
-            sig = strategy.generate_signal(df.iloc[: i + 1])
+            sig, _ = strategy.generate_signal(df.iloc[: i + 1])
             signals.append(sig)
         signal_series = pd.Series(signals, index=df.index)
         logger.info("루프 신호 생성 사용 (fallback)")

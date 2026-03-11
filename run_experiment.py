@@ -19,7 +19,7 @@ import yaml
 
 def update_config(threshold, sl_pct, tp_pct, upper_barrier, lower_barrier, max_holding):
     """config.yaml을 업데이트."""
-    config_path = "strategies/lgbm_classifier/config.yaml"
+    config_path = "strategies/btc_1h_momentum/config.yaml"
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
