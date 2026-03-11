@@ -310,7 +310,10 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
 
     if pv_result.get("trades", 0) == 0:
         print("FAIL: Post-Validation 구간에 거래가 없습니다 (보수적).")
-        return all_scenario_results
+        return all_scenario_results, {
+            "passed": False, "conservative": {"pv_pf": 0, "pv_return": 0, "pv_trades": 0},
+            "strict_oos": {},
+        }
 
     pv_pf = pv_result["pf"]
     pv_return = pv_result["total_return"]
@@ -342,12 +345,44 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
     print(f"\n최종 결과: {'SUCCESS' if all_passed else 'FAIL'}")
     print("=" * 80)
 
-    return all_scenario_results
+    # 구조화된 결과 (프로그래밍 API용)
+    structured = {
+        "passed": all_passed,
+        "conservative": {
+            "is_pf": is_pf,
+            "pv_pf": pv_pf,
+            "pv_return": pv_return,
+            "pv_trades": pv_trades,
+            "pf_drop": pf_drop,
+        },
+        "strict_oos": {},
+    }
+
+    strict_result = conservative.get("Strict OOS (2026-01-19~)", {})
+    if strict_result:
+        structured["strict_oos"] = {
+            "pf": strict_result.get("pf", 0),
+            "trades": strict_result.get("trades", 0),
+            "total_return": strict_result.get("total_return", 0),
+        }
+
+    return all_scenario_results, structured
 
 
 if __name__ == "__main__":
+    import json as _json
+
     parser = argparse.ArgumentParser(description="OOS 검증")
     parser.add_argument("--strategy", type=str, default="btc_1h_momentum",
                         help="전략 이름 (기본: btc_1h_momentum)")
+    parser.add_argument("--json", action="store_true",
+                        help="JSON 형식으로 결과 출력")
     args = parser.parse_args()
-    run_oos_validation(strategy_name=args.strategy)
+    result = run_oos_validation(strategy_name=args.strategy)
+
+    if args.json and isinstance(result, tuple) and len(result) == 2:
+        _, structured = result
+        print("\n__JSON_RESULT__")
+        print(_json.dumps(structured, ensure_ascii=False))
+    elif isinstance(result, tuple):
+        pass  # 일반 출력 이미 완료

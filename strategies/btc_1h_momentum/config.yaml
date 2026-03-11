@@ -19,6 +19,15 @@ params:
       - {zscore_below: 2, confidence: 0.44}
       # zscore >= 2 이면 진입 차단
 
+retrain:
+  enabled: true
+  window_type: sliding
+  window_months: 15
+  min_pf_ratio: 0.9
+  auto_ensemble: true
+  ensemble_n_folds: 2
+  use_optuna: false
+
 execution:
   order_type: limit
   limit_offset: 0.001

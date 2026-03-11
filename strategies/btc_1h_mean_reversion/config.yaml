@@ -29,6 +29,15 @@ params:
     enabled: true
     block_zscore: 1.0  # OI zscore >= 1.0 이면 진입 차단 (과밀 포지션)
 
+retrain:
+  enabled: true
+  window_type: expanding
+  window_months: 15
+  min_pf_ratio: 0.9
+  auto_ensemble: false
+  ensemble_n_folds: 1
+  use_optuna: false
+
 execution:
   order_type: limit
   limit_offset: 0.001

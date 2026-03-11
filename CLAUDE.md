@@ -77,3 +77,4 @@ strategies/eth_1h_momentum/  → strategy.py, config.yaml, models/
 | `verify-risk` | 리스크 규칙 검증 (파라미터 동기화, CircuitBreaker) |
 | `verify-data-safety` | 데이터 안전성 검증 (atomic write, append-only, .env) |
 | `verify-ml` | ML 규칙 검증 (라벨, 모델 파일, Walk-Forward, Live 재학습 금지) |
+| `verify-portfolio` | 포트폴리오 레이어 검증 (자본 배분, 리스크, 가상 포지션, 전략 정합성) |
