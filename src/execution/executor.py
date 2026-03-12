@@ -311,7 +311,11 @@ class OrderExecutor:
         logger.info(f"PnL 기록: {symbol} {pnl:+.4f} (누적: {self._cumulative_pnl:+.4f})")
 
     @staticmethod
-    def _save_state(positions: dict, extra_state: Optional[dict] = None) -> None:
+    def _save_state(
+        positions: dict,
+        extra_state: Optional[dict] = None,
+        state_path: str = STATE_PATH,
+    ) -> None:
         """현재 상태를 Atomic Write로 JSON 파일에 저장.
 
         쓰다가 프로세스가 죽어도 파일이 깨지지 않도록
@@ -320,6 +324,7 @@ class OrderExecutor:
         Args:
             positions: 현재 포지션 딕셔너리.
             extra_state: 추가 상태 (circuit_breaker, pnl_tracker 등).
+            state_path: 상태 파일 경로. 기본값은 STATE_PATH.
         """
         state = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -327,10 +332,10 @@ class OrderExecutor:
         }
         if extra_state:
             state.update(extra_state)
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False, dir=os.path.dirname(STATE_PATH)
+            mode="w", suffix=".json", delete=False, dir=os.path.dirname(state_path)
         ) as f:
             json.dump(state, f, indent=2, default=str)
             temp_path = f.name
-        shutil.move(temp_path, STATE_PATH)
+        shutil.move(temp_path, state_path)

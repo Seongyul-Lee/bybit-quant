@@ -25,20 +25,38 @@ class BybitDataCollector:
 
     OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
-    def __init__(self, api_key: Optional[str] = None, secret: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        secret: Optional[str] = None,
+        testnet: bool = False,
+    ) -> None:
         """BybitDataCollector 초기화.
 
         Args:
             api_key: Bybit API 키. None이면 환경변수에서 로드.
             secret: Bybit API 시크릿. None이면 환경변수에서 로드.
+            testnet: True이면 Bybit testnet (sandbox) 모드 사용.
         """
+        if testnet:
+            key = api_key or os.getenv("BYBIT_TESTNET_API_KEY")
+            sec = secret or os.getenv("BYBIT_TESTNET_SECRET")
+        else:
+            key = api_key or os.getenv("BYBIT_API_KEY")
+            sec = secret or os.getenv("BYBIT_SECRET")
+
         self.exchange = ccxt.bybit({
-            "apiKey": api_key or os.getenv("BYBIT_API_KEY"),
-            "secret": secret or os.getenv("BYBIT_SECRET"),
+            "apiKey": key,
+            "secret": sec,
             "options": {"defaultType": "linear"},
             "enableRateLimit": True,
         })
-        logger.info("BybitDataCollector 초기화 완료")
+
+        if testnet:
+            self.exchange.set_sandbox_mode(True)
+            logger.info("[TESTNET] BybitDataCollector 초기화 완료 (sandbox)")
+        else:
+            logger.info("BybitDataCollector 초기화 완료")
 
     def fetch_ohlcv(
         self,
