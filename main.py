@@ -62,13 +62,19 @@ def _timeframe_to_seconds(timeframe: str) -> int:
     return value * multipliers.get(unit, 60)
 
 
-def _load_saved_state() -> dict:
-    """current_state.json에서 저장된 상태를 로드.
+STATE_PATH_MAINNET = "config/current_state.json"
+STATE_PATH_TESTNET = "config/current_state_testnet.json"
+
+
+def _load_saved_state(state_path: str = STATE_PATH_MAINNET) -> dict:
+    """저장된 상태를 로드.
+
+    Args:
+        state_path: 상태 파일 경로.
 
     Returns:
         저장된 상태 딕셔너리. 파일 없으면 빈 딕셔너리.
     """
-    state_path = "config/current_state.json"
     if os.path.exists(state_path):
         try:
             import json
@@ -145,7 +151,7 @@ def _load_portfolio_config() -> dict:
     return raw.get("portfolio", raw)
 
 
-def run_live(strategy_name: str | None = None) -> None:
+def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     """실거래 모드 실행.
 
     포트폴리오 레이어를 통해 전략을 관리한다.
@@ -153,6 +159,7 @@ def run_live(strategy_name: str | None = None) -> None:
 
     Args:
         strategy_name: 전략 폴더명. None이면 portfolio.yaml 전체.
+        testnet: True이면 Bybit testnet (sandbox) 모드.
     """
     from src.data.collector import BybitDataCollector
     from src.risk.manager import RiskManager, PnLTracker
@@ -177,12 +184,16 @@ def run_live(strategy_name: str | None = None) -> None:
     virtual_tracker = VirtualPositionTracker()
 
     # 3. 인프라 초기화
-    collector = BybitDataCollector()
+    collector = BybitDataCollector(testnet=testnet)
     risk_manager = RiskManager()
     exchange = collector.exchange
     executor = OrderExecutor(exchange)
     notifier = TelegramNotifier()
     pnl_tracker = PnLTracker()
+
+    # testnet 관련 설정
+    log_prefix = "[TESTNET] " if testnet else ""
+    state_path = STATE_PATH_TESTNET if testnet else STATE_PATH_MAINNET
 
     # 레버리지 설정
     leverage = risk_manager.params["position"]["max_leverage"]
@@ -200,7 +211,7 @@ def run_live(strategy_name: str | None = None) -> None:
             logger.warning(f"레버리지 설정 실패 ({sym}): {e}")
 
     # 4. 저장된 상태 복원
-    saved_state = _load_saved_state()
+    saved_state = _load_saved_state(state_path)
     if "circuit_breaker" in saved_state:
         risk_manager.circuit_breaker.from_dict(saved_state["circuit_breaker"])
         logger.info(f"CircuitBreaker 상태 복원: {saved_state['circuit_breaker']}")
@@ -243,7 +254,9 @@ def run_live(strategy_name: str | None = None) -> None:
     poll_interval = max(int(min_tf_seconds) // 6, 30)
 
     active_names = ", ".join(portfolio_manager.get_active_strategies())
-    logger.info(f"실거래 시작: [{active_names}] | 폴링 {poll_interval}초")
+    logger.info(f"{log_prefix}실거래 시작: [{active_names}] | 폴링 {poll_interval}초")
+    if testnet:
+        notifier.send_sync(f"[TESTNET] 실거래 시작: [{active_names}]")
 
     # 7. 포트폴리오 가치 피크 추적
     peak_value = saved_state.get("peak_value", 0.0)
@@ -258,7 +271,7 @@ def run_live(strategy_name: str | None = None) -> None:
             "peak_value": peak_value,
             "last_processed_bars": last_processed_bars,
             "last_trade_ids": list(last_trade_ids)[-100:],
-        })
+        }, state_path=state_path)
 
     while True:
         try:
@@ -344,7 +357,7 @@ def run_live(strategy_name: str | None = None) -> None:
             )
             if not ok:
                 logger.warning(f"일일 손실 한도: {reason}")
-                notifier.send_sync(f"[경고] {reason} — 당일 추가 진입 차단")
+                notifier.send_sync(f"{log_prefix}[경고] {reason} — 당일 추가 진입 차단")
                 prev_positions = positions
                 _save_current_state()
                 time.sleep(poll_interval)
@@ -357,7 +370,7 @@ def run_live(strategy_name: str | None = None) -> None:
             if portfolio_scale <= 0:
                 logger.warning("포트폴리오 MDD 한도 — 전체 차단")
                 notifier.send_sync(
-                    "[긴급] 포트폴리오 MDD 한도 도달 — 전체 진입 차단"
+                    f"{log_prefix}[긴급] 포트폴리오 MDD 한도 도달 — 전체 진입 차단"
                 )
                 prev_positions = positions
                 _save_current_state()
@@ -370,7 +383,7 @@ def run_live(strategy_name: str | None = None) -> None:
                 if not portfolio_risk.check_strategy_health(name):
                     strategy_scales[name] = 0.0
                     logger.warning(f"전략 비활성화 (누적 PF 미달): {name}")
-                    notifier.send_sync(f"[경고] {name} 전략 비활성화 (PF 미달)")
+                    notifier.send_sync(f"{log_prefix}[경고] {name} 전략 비활성화 (PF 미달)")
                 else:
                     strategy_scales[name] = portfolio_risk.get_strategy_scale(name)
 
@@ -423,10 +436,10 @@ def run_live(strategy_name: str | None = None) -> None:
 
                 if not ok:
                     logger.warning(f"리스크 체크 실패 ({strat_name}): {reason}")
-                    notifier.send_sync(f"[경고] 리스크 체크 실패: {reason}")
+                    notifier.send_sync(f"{log_prefix}[경고] 리스크 체크 실패: {reason}")
                     if "Circuit Breaker" in reason:
                         notifier.send_sync(
-                            f"[긴급] Circuit Breaker 발동 — 수동 리셋 필요: {reason}"
+                            f"{log_prefix}[긴급] Circuit Breaker 발동 — 수동 리셋 필요: {reason}"
                         )
                     continue
 
@@ -473,7 +486,7 @@ def run_live(strategy_name: str | None = None) -> None:
 
                     if exec_order:
                         msg = (
-                            f"주문 실행: {delta['side'].upper()} "
+                            f"{log_prefix}주문 실행: {delta['side'].upper()} "
                             f"{delta['amount']:.4f} {sym} @ {entry_price:.2f} "
                             f"({strat_name})"
                         )
@@ -621,12 +634,21 @@ def main() -> None:
         required=True,
         help="실행 모드: backtest 또는 live",
     )
+    parser.add_argument(
+        "--testnet",
+        action="store_true",
+        default=False,
+        help="Bybit testnet (sandbox) 모드로 실행",
+    )
 
     args = parser.parse_args()
 
     if args.mode == "live":
-        run_live(args.strategy)
+        run_live(args.strategy, testnet=args.testnet)
     elif args.mode == "backtest":
+        if args.testnet:
+            logger.error("--testnet은 live 모드에서만 사용 가능합니다.")
+            sys.exit(1)
         if not args.strategy:
             logger.error("백테스트 모드에서는 --strategy가 필수입니다.")
             sys.exit(1)
