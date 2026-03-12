@@ -3,7 +3,7 @@
 ## 프로젝트 개요
 Bybit 거래소 기반 암호화폐 멀티 전략 퀀트 트레이딩 시스템.
 백테스팅과 실거래가 동일한 전략 코드(`BaseStrategy.generate_signal`)를 공유한다.
-현재 활성 전략: BTC/1h 모멘텀, ETH/1h 모멘텀 (LightGBM 2클래스, 롱 전용, 앙상블).
+현재 활성 전략: BTC/1h 모멘텀, ETH/1h 모멘텀, BTC/1h 평균회귀 (LightGBM 2클래스, 롱 전용, 앙상블).
 
 ## 커맨드
 ```bash
@@ -13,6 +13,8 @@ python train_lgbm.py --strategy btc_1h_momentum --no-optuna # 모델 학습
 python train_lgbm.py --strategy eth_1h_momentum --optuna-trials 100
 python backtest.py --strategy btc_1h_momentum               # 백테스트
 python oos_validation.py --strategy btc_1h_momentum         # OOS 검증
+python retrain.py --strategy btc_1h_momentum                 # 주기적 재학습
+python retrain.py --all --dry-run --skip-data-collection     # 전체 전략 검증 (dry-run)
 python main.py --mode live                                   # 실거래 (포트폴리오)
 ```
 
@@ -22,6 +24,7 @@ python main.py --mode live                                   # 실거래 (포트
         → PortfolioRiskManager → RiskManager → VirtualPositionTracker → OrderExecutor
 백테스트: Parquet → Strategy.generate_signals_vectorized() → vectorbt → Reporter
 ML학습:  Parquet → FeatureEngine(symbol별) → TripleBarrierLabeler → WalkForwardTrainer → 모델저장
+재학습:  retrain.py → 데이터 증분수집 → 백업 → 재학습 → OOS 검증 → 교체/복원
 ```
 
 ### 핵심 규칙
@@ -38,8 +41,10 @@ data/processed/      → {SYMBOL}_{timeframe}_features.parquet
 src/portfolio/       → manager.py, risk.py, virtual_position.py
 src/                 → data/, strategies/base.py, risk/, execution/, analytics/, utils/
 strategies/_common/  → features.py, labeler.py, trainer.py, evaluator.py (공통 ML)
-strategies/btc_1h_momentum/  → strategy.py, config.yaml, models/
-strategies/eth_1h_momentum/  → strategy.py, config.yaml, models/
+strategies/btc_1h_momentum/      → strategy.py, config.yaml, models/
+strategies/eth_1h_momentum/      → strategy.py, config.yaml, models/
+strategies/btc_1h_mean_reversion/ → strategy.py, labeler.py, config.yaml, models/
+retrain.py               → 주기적 재학습 파이프라인 (데이터 수집→학습→OOS 검증→교체)
 ```
 
 ## 코딩 컨벤션
@@ -57,7 +62,7 @@ strategies/eth_1h_momentum/  → strategy.py, config.yaml, models/
 ## LightGBM 전략 상세
 - **라벨**: 2클래스 — 매수(1) / 비매수(0), 롱 전용
 - **모델 파일**: `latest.txt`, `fold_XX.txt`, `feature_names.json`, `best_params.json`, `training_meta.json`
-- **Walk-Forward**: 확장 윈도우(6개월+), Embargo 24봉, Optuna 첫 fold만 튜닝
+- **Walk-Forward**: Sliding/Expanding 윈도우(config.yaml `retrain.window_type`), Embargo 24봉, Optuna 첫 fold만 튜닝
 - **앙상블**: config.yaml `ensemble_folds`로 여러 fold 평균 예측
 - **FeatureEngine**: `symbol` config 키로 심볼별 펀딩비 경로 자동 결정
 
