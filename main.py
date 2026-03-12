@@ -285,7 +285,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 sym = _convert_symbol(sym_raw)
                 tf = cfg.get("strategy", {}).get("timeframe", "1h")
 
-                df = collector.fetch_ohlcv(symbol=sym, timeframe=tf, limit=1000)
+                df = collector.fetch_ohlcv(symbol=sym, timeframe=tf, limit=2000)
                 current_bar = str(df["timestamp"].iloc[-1])
 
                 # 봉 중복 체크
