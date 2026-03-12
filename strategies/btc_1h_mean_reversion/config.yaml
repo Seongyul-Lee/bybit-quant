@@ -31,6 +31,7 @@ params:
 
 retrain:
   enabled: true
+  interval_days: 30
   window_type: expanding
   window_months: 15
   min_pf_ratio: 0.9

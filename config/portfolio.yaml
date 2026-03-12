@@ -20,3 +20,26 @@ portfolio:
     max_daily_loss: -0.03
     strategy_disable_threshold: 0.8
     strategy_disable_min_trades: 50
+
+    # 점진적 포지션 축소 (MDD 기반)
+    drawdown_scaling:
+      enabled: true
+      levels:
+        - {mdd_threshold: -0.03, position_scale: 0.75}
+        - {mdd_threshold: -0.05, position_scale: 0.50}
+        - {mdd_threshold: -0.07, position_scale: 0.25}
+        - {mdd_threshold: -0.10, position_scale: 0.00}
+
+    # Rolling PF 기반 전략별 축소
+    rolling_pf:
+      enabled: true
+      window: 20
+      scale_threshold: 0.7
+      scale_factor: 0.50
+      disable_threshold: 0.5
+
+    # 복구 조건
+    recovery:
+      enabled: true
+      consecutive_wins_to_upgrade: 3
+      min_hours_at_level: 24

@@ -134,12 +134,14 @@ class PortfolioManager:
         signals: dict[str, tuple[int, float]],
         portfolio_value: float,
         virtual_tracker: VirtualPositionTracker,
+        portfolio_scale: float = 1.0,
+        strategy_scales: dict[str, float] | None = None,
     ) -> list[dict]:
         """시그널을 기반으로 주문 목록 생성.
 
         자본 배분 규칙:
         1. 매수 시그널 전략만 필터링
-        2. 각 전략에 position_pct_per_strategy 적용
+        2. 각 전략에 position_pct_per_strategy × portfolio_scale × strategy_scale 적용
         3. 이미 포지션 보유 중인 전략은 제외
         4. 동일 심볼 합산 캡 적용
         5. 전체 노출 캡 적용
@@ -149,12 +151,15 @@ class PortfolioManager:
             signals: {전략이름: (signal, probability)} 딕셔너리.
             portfolio_value: 현재 포트폴리오 가치 (USDT).
             virtual_tracker: 현재 가상 포지션 추적기.
+            portfolio_scale: MDD 기반 포트폴리오 레벨 스케일링 (0.0~1.0).
+            strategy_scales: {전략이름: 스케일링 계수} Rolling PF 기반 (0.0~1.0).
 
         Returns:
             주문 목록. 각 주문은:
             {"strategy": name, "symbol": sym, "side": "buy",
              "size": 0.002, "entry_price": 80000.0}
         """
+        strategy_scales = strategy_scales or {}
         orders: list[dict] = []
 
         # 1. 매수 시그널만 필터링
@@ -191,9 +196,10 @@ class PortfolioManager:
                 logger.info(f"이미 포지션 보유: {name} | {symbol} — 스킵")
                 continue
 
-            # 진입 가격은 나중에 실시간으로 결정되므로 여기서는 0으로 표시
-            # 실제로는 main.py에서 df["close"].iloc[-1]을 사용
-            order_value = portfolio_value * self.position_pct
+            # 스케일링 적용: position_pct × portfolio_scale × strategy_scale
+            strat_scale = strategy_scales.get(name, 1.0)
+            effective_pct = self.position_pct * portfolio_scale * strat_scale
+            order_value = portfolio_value * effective_pct
 
             # 최소 주문 금액 체크
             if order_value < 100:
@@ -207,7 +213,7 @@ class PortfolioManager:
                     "strategy": name,
                     "symbol": symbol,
                     "side": "buy",
-                    "size_pct": self.position_pct,
+                    "size_pct": effective_pct,
                     "signal": signal,
                     "probability": prob,
                 }
