@@ -246,7 +246,7 @@ def run_live(strategy_name: str | None = None) -> None:
     logger.info(f"실거래 시작: [{active_names}] | 폴링 {poll_interval}초")
 
     # 7. 포트폴리오 가치 피크 추적
-    peak_value = 0.0
+    peak_value = saved_state.get("peak_value", 0.0)
 
     def _save_current_state() -> None:
         """현재 상태를 atomic write로 저장."""
@@ -255,6 +255,7 @@ def run_live(strategy_name: str | None = None) -> None:
             "pnl_tracker": pnl_tracker.to_dict(),
             "virtual_positions": virtual_tracker.to_dict(),
             "portfolio_risk": portfolio_risk.to_dict(),
+            "peak_value": peak_value,
             "last_processed_bars": last_processed_bars,
             "last_trade_ids": list(last_trade_ids)[-100:],
         })
@@ -332,37 +333,64 @@ def run_live(strategy_name: str | None = None) -> None:
                 time.sleep(poll_interval)
                 continue
 
-            # 11. 포트폴리오 리스크 체크
+            # 11. 잔고 조회 및 피크 업데이트
             balance = exchange.fetch_balance()
             portfolio_value = float(balance.get("total", {}).get("USDT", 0))
             peak_value = max(peak_value, portfolio_value)
 
-            ok, reason = portfolio_risk.check_portfolio(portfolio_value, peak_value)
+            # 12. 일일 손실 체크
+            ok, reason = portfolio_risk.check_daily_loss(
+                pnl_tracker.daily_pnl, portfolio_value
+            )
             if not ok:
-                logger.warning(f"포트폴리오 리스크: {reason}")
-                notifier.send_sync(f"[경고] 포트폴리오 리스크: {reason}")
+                logger.warning(f"일일 손실 한도: {reason}")
+                notifier.send_sync(f"[경고] {reason} — 당일 추가 진입 차단")
                 prev_positions = positions
                 _save_current_state()
                 time.sleep(poll_interval)
                 continue
 
-            # 12. 전략별 건강 체크 (비활성화된 전략 시그널 제거)
+            # 13. 포트폴리오 MDD 스케일링 계수
+            portfolio_scale = portfolio_risk.get_position_scale(
+                portfolio_value, peak_value
+            )
+            if portfolio_scale <= 0:
+                logger.warning("포트폴리오 MDD 한도 — 전체 차단")
+                notifier.send_sync(
+                    "[긴급] 포트폴리오 MDD 한도 도달 — 전체 진입 차단"
+                )
+                prev_positions = positions
+                _save_current_state()
+                time.sleep(poll_interval)
+                continue
+
+            # 14. 전략별 스케일링 계수 (Rolling PF + 누적 PF)
+            strategy_scales: dict[str, float] = {}
+            for name in signals:
+                if not portfolio_risk.check_strategy_health(name):
+                    strategy_scales[name] = 0.0
+                    logger.warning(f"전략 비활성화 (누적 PF 미달): {name}")
+                    notifier.send_sync(f"[경고] {name} 전략 비활성화 (PF 미달)")
+                else:
+                    strategy_scales[name] = portfolio_risk.get_strategy_scale(name)
+
+            # 활성 전략만 필터
             healthy_signals = {
                 name: sig
                 for name, sig in signals.items()
-                if portfolio_risk.check_strategy_health(name)
+                if strategy_scales.get(name, 0) > 0
             }
-            for name in signals:
-                if name not in healthy_signals:
-                    logger.warning(f"전략 비활성화: {name} (PF 미달)")
-                    notifier.send_sync(f"[경고] {name} 전략 비활성화 (PF 미달)")
 
-            # 13. 자본 배분 → 주문 목록
+            # 15. 자본 배분 → 주문 목록 (스케일링 적용)
             orders = portfolio_manager.allocate(
-                healthy_signals, portfolio_value, virtual_tracker
+                healthy_signals,
+                portfolio_value,
+                virtual_tracker,
+                portfolio_scale=portfolio_scale,
+                strategy_scales=strategy_scales,
             )
 
-            # 14. 각 주문 실행
+            # 16. 각 주문 실행
             for order in orders:
                 strat_name = order["strategy"]
                 sym = order["symbol"]
@@ -452,7 +480,7 @@ def run_live(strategy_name: str | None = None) -> None:
                         logger.info(msg)
                         notifier.send_sync(msg)
 
-            # 15. 상태 업데이트 및 저장
+            # 17. 상태 업데이트 및 저장
             prev_positions = executor.sync_positions()
             _save_current_state()
 

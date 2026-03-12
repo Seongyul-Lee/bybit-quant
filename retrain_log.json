@@ -1,0 +1,53 @@
+[
+  {
+    "date": "2026-03-12",
+    "strategy": "btc_1h_momentum",
+    "status": "kept",
+    "old_pv_pf": 2.0863462644496162,
+    "new_pv_pf": 1.0583445104123708,
+    "old_ensemble": [
+      11,
+      13
+    ],
+    "new_ensemble": [
+      13,
+      14
+    ],
+    "window_type": "sliding",
+    "window_months": 15,
+    "reason": "PV PF 하락 과도: 2.09 → 1.06 (기준: ×0.9=1.88)",
+    "strict_oos_pf": 0.2996156803349681
+  },
+  {
+    "date": "2026-03-12",
+    "strategy": "eth_1h_momentum",
+    "status": "updated",
+    "old_pv_pf": 2.1067813753321847,
+    "new_pv_pf": 1.9291982731172248,
+    "old_ensemble": [
+      12,
+      14
+    ],
+    "new_ensemble": [
+      10,
+      14
+    ],
+    "window_type": "sliding",
+    "window_months": 12,
+    "reason": "모델 교체 완료: PV PF 2.1067813753321847 → 1.93",
+    "strict_oos_pf": 0.6374390256006959
+  },
+  {
+    "date": "2026-03-12",
+    "strategy": "btc_1h_mean_reversion",
+    "status": "updated",
+    "old_pv_pf": 2.352808541963917,
+    "new_pv_pf": 2.352808541963917,
+    "old_ensemble": null,
+    "new_ensemble": null,
+    "window_type": "expanding",
+    "window_months": 15,
+    "reason": "모델 교체 완료: PV PF 2.352808541963917 → 2.35",
+    "strict_oos_pf": 0.5763818663013488
+  }
+]
