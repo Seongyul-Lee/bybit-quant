@@ -10,6 +10,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -285,7 +286,11 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 sym = _convert_symbol(sym_raw)
                 tf = cfg.get("strategy", {}).get("timeframe", "1h")
 
-                df = collector.fetch_ohlcv(symbol=sym, timeframe=tf, limit=2000)
+                since_dt = datetime.now(timezone.utc) - timedelta(hours=2000)
+                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                df = collector.fetch_ohlcv_bulk(
+                    symbol=sym, timeframe=tf, since=since_iso
+                )
                 current_bar = str(df["timestamp"].iloc[-1])
 
                 # 봉 중복 체크
