@@ -44,6 +44,15 @@ def load_strategy(strategy_name: str):
     elif strategy_name == "btc_1h_mean_reversion":
         from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
         return MeanReversionStrategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_momentum_v2":
+        from strategies.btc_1h_momentum_v2.strategy import BTCMomentumV2Strategy
+        return BTCMomentumV2Strategy(config=config.get("params", {}))
+    elif strategy_name == "eth_1h_momentum_v2":
+        from strategies.eth_1h_momentum_v2.strategy import ETHMomentumV2Strategy
+        return ETHMomentumV2Strategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_mean_reversion_v2":
+        from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
+        return BTCMeanReversionV2Strategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 

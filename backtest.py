@@ -52,6 +52,15 @@ def run(
     elif strategy_name == "btc_1h_mean_reversion":
         from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
         strategy = MeanReversionStrategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_momentum_v2":
+        from strategies.btc_1h_momentum_v2.strategy import BTCMomentumV2Strategy
+        strategy = BTCMomentumV2Strategy(config=config.get("params", {}))
+    elif strategy_name == "eth_1h_momentum_v2":
+        from strategies.eth_1h_momentum_v2.strategy import ETHMomentumV2Strategy
+        strategy = ETHMomentumV2Strategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_mean_reversion_v2":
+        from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
+        strategy = BTCMeanReversionV2Strategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 
