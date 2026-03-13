@@ -1,11 +1,27 @@
-"""Triple Barrier 라벨링 모듈.
+"""라벨링 모듈.
 
-ATR 기반 상/하 배리어와 최대 보유 기간으로 2클래스 라벨을 생성한다.
-라벨: 1(매수), 0(비매수).
+Triple Barrier (2클래스 분류)와 Forward Return (회귀) 라벨러를 제공한다.
 """
 
 import numpy as np
 import pandas as pd
+
+
+def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ATR 계산 (공통 유틸).
+
+    Args:
+        df: OHLCV 데이터프레임.
+        period: ATR 기간.
+
+    Returns:
+        ATR 시리즈.
+    """
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return true_range.rolling(period).mean()
 
 
 class TripleBarrierLabeler:
@@ -95,8 +111,71 @@ class TripleBarrierLabeler:
     @staticmethod
     def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         """ATR 계산 (fallback)."""
-        high_low = df["high"] - df["low"]
-        high_close = (df["high"] - df["close"].shift()).abs()
-        low_close = (df["low"] - df["close"].shift()).abs()
-        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        return true_range.rolling(period).mean()
+        return _compute_atr(df, period)
+
+
+class ForwardReturnLabeler:
+    """미래 N봉 수익률을 연속값으로 라벨링.
+
+    각 봉에서 미래 forward_period 봉 동안의 수익률을 계산하되,
+    ATR 기반 배리어로 클리핑하여 극단값을 제한한다.
+
+    Attributes:
+        forward_period: 미래 수익률 계산 기간 (봉 수).
+        barrier_atr_mult: 수익률 클리핑 ATR 배수.
+        use_log_return: True면 로그 수익률 사용.
+    """
+
+    def __init__(
+        self,
+        forward_period: int = 24,
+        barrier_atr_mult: float = 3.0,
+        use_log_return: bool = False,
+    ) -> None:
+        """ForwardReturnLabeler 초기화.
+
+        Args:
+            forward_period: 미래 수익률 계산 기간 (봉 수). 기본 24.
+            barrier_atr_mult: 수익률 클리핑 ATR 배수. 기본 3.0.
+            use_log_return: True면 로그 수익률. 기본 False.
+        """
+        self.forward_period = forward_period
+        self.barrier_atr_mult = barrier_atr_mult
+        self.use_log_return = use_log_return
+
+    def generate_labels(self, df: pd.DataFrame) -> pd.Series:
+        """미래 수익률 라벨 생성.
+
+        로직:
+        1. future_return = (close[t+forward_period] - close[t]) / close[t]
+           (use_log_return이면 log(close[t+forward_period] / close[t]))
+        2. atr_pct = atr_14 / close
+        3. clip_bound = atr_pct * barrier_atr_mult
+        4. future_return = future_return.clip(-clip_bound, +clip_bound)
+        5. 마지막 forward_period 봉은 NaN
+
+        Args:
+            df: OHLCV + atr_14 데이터프레임.
+
+        Returns:
+            연속값 라벨 시리즈 (이름: "label").
+        """
+        close = df["close"]
+        future_close = close.shift(-self.forward_period)
+
+        if self.use_log_return:
+            future_return = np.log(future_close / close)
+        else:
+            future_return = (future_close - close) / close
+
+        # ATR 기반 클리핑
+        if "atr_14" in df.columns:
+            atr = df["atr_14"]
+        else:
+            atr = _compute_atr(df)
+
+        atr_pct = atr / close
+        clip_bound = atr_pct * self.barrier_atr_mult
+        future_return = future_return.clip(lower=-clip_bound, upper=clip_bound)
+
+        return pd.Series(future_return.values, index=df.index, name="label")

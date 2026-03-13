@@ -32,6 +32,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LightGBM 모델 학습")
     parser.add_argument("--strategy", type=str, default="btc_1h_momentum",
                         help="전략 이름 (기본: btc_1h_momentum)")
+    parser.add_argument("--mode", type=str, default="classifier",
+                        choices=["classifier", "regressor"],
+                        help="모델 유형: classifier (기본) 또는 regressor")
+    parser.add_argument("--forward-period", type=int, default=24,
+                        help="[regressor] 미래 수익률 기간 (봉 수, 기본: 24)")
+    parser.add_argument("--barrier-atr-mult", type=float, default=3.0,
+                        help="[regressor] 수익률 클리핑 ATR 배수 (기본: 3.0)")
     parser.add_argument("--symbol", type=str, default=None, help="심볼 (미지정 시 전략 config에서 로드)")
     parser.add_argument("--timeframe", type=str, default=None, help="타임프레임 (미지정 시 전략 config에서 로드)")
     parser.add_argument("--optuna-trials", type=int, default=50, help="Optuna 시행 수 (기본: 50)")
@@ -131,8 +138,19 @@ def main() -> None:
         logger.info(f"선별 피처 사용: {len(feature_names)}개")
 
     # 2. 라벨 생성 (전략별 라벨러 선택)
-    labeler_type = params_cfg.get("labeler_type", "triple_barrier") if 'params_cfg' in locals() else "triple_barrier"
-    if labeler_type == "mean_reversion":
+    mode = params_cfg.get("mode", args.mode) if params_cfg else args.mode
+    labeler_type = params_cfg.get("labeler_type", "triple_barrier") if params_cfg else "triple_barrier"
+
+    if mode == "regressor":
+        from strategies._common.labeler import ForwardReturnLabeler
+        forward_period = params_cfg.get("forward_period", args.forward_period) if params_cfg else args.forward_period
+        barrier_atr_mult = params_cfg.get("barrier_atr_mult", args.barrier_atr_mult) if params_cfg else args.barrier_atr_mult
+        labeler = ForwardReturnLabeler(
+            forward_period=forward_period,
+            barrier_atr_mult=barrier_atr_mult,
+        )
+        logger.info(f"ForwardReturn 라벨링 시작... (period={forward_period}, clip={barrier_atr_mult}x ATR)")
+    elif labeler_type == "mean_reversion":
         from strategies.btc_1h_mean_reversion.labeler import MeanReversionLabeler
         labeler = MeanReversionLabeler(
             oversold_bb_threshold=params_cfg.get("oversold_bb_threshold", 0.2),
@@ -181,8 +199,14 @@ def main() -> None:
     logger.info(f"NaN 제거: {before_len} → {len(df)}행")
 
     # 라벨 분포 출력
-    label_counts = df["label"].value_counts().sort_index()
-    logger.info(f"라벨 분포: {dict(label_counts)}")
+    if mode == "regressor":
+        logger.info(
+            f"라벨 통계: mean={df['label'].mean():.6f}, std={df['label'].std():.6f}, "
+            f"min={df['label'].min():.6f}, max={df['label'].max():.6f}"
+        )
+    else:
+        label_counts = df["label"].value_counts().sort_index()
+        logger.info(f"라벨 분포: {dict(label_counts)}")
 
     # 2.5. 상관관계 기반 피처 제거
     if args.corr_threshold > 0:
@@ -212,6 +236,7 @@ def main() -> None:
 
     n_trials = 0 if (args.no_optuna or loaded_params) else args.optuna_trials
     trainer = WalkForwardTrainer(
+        mode=mode,
         min_train_months=args.min_train_months,
         val_months=args.val_months,
         embargo_bars=args.embargo_bars,
@@ -226,15 +251,28 @@ def main() -> None:
     # 4. 과적합 체크 (trainer.run()에서 이미 gap 계산 및 필터링 완료, 여기서는 로그만 보충)
     overfit_count = 0
     for fm in result["folds_metrics"]:
-        ov = ModelEvaluator.check_overfitting(fm["train_f1_macro"], fm["val_f1_macro"])
-        fm["overfit_check"] = ov
-        if ov["is_overfit"]:
-            overfit_count += 1
-            logger.warning(
-                f"Fold {fm['fold']}: 과적합 의심 "
-                f"(gap={ov['gap']:.4f}, train={fm['train_f1_macro']:.4f}, "
-                f"val={fm['val_f1_macro']:.4f})"
+        if mode == "regressor":
+            ov = ModelEvaluator.check_overfitting_regression(
+                fm.get("train_mae", 0.0), fm.get("val_mae", 0.0)
             )
+            fm["overfit_check"] = ov
+            if ov["is_overfit"]:
+                overfit_count += 1
+                logger.warning(
+                    f"Fold {fm['fold']}: 과적합 의심 "
+                    f"(MAE gap={ov['gap']:.6f}, train_mae={fm.get('train_mae', 0):.6f}, "
+                    f"val_mae={fm.get('val_mae', 0):.6f})"
+                )
+        else:
+            ov = ModelEvaluator.check_overfitting(fm["train_f1_macro"], fm["val_f1_macro"])
+            fm["overfit_check"] = ov
+            if ov["is_overfit"]:
+                overfit_count += 1
+                logger.warning(
+                    f"Fold {fm['fold']}: 과적합 의심 "
+                    f"(gap={ov['gap']:.4f}, train={fm['train_f1_macro']:.4f}, "
+                    f"val={fm['val_f1_macro']:.4f})"
+                )
 
     total_folds = len(result["folds_metrics"])
     if overfit_count == total_folds:
@@ -256,22 +294,33 @@ def main() -> None:
 
     # 6. 결과 출력
     print("\n" + "=" * 60)
-    print("LightGBM 학습 완료")
+    print(f"LightGBM 학습 완료 (mode={mode})")
     print("=" * 60)
     print(f"전략: {args.strategy} | 심볼: {symbol} | 타임프레임: {timeframe}")
     print(f"피처 수: {len(feature_names)}")
     print(f"Fold 수: {len(result['folds_metrics'])}")
     selected_fm = result["folds_metrics"][result["best_fold_idx"]]
-    print(
-        f"선택 Fold: {result['best_fold_idx']} "
-        f"(Val F1: {result['best_val_f1']:.4f}, "
-        f"gap: {selected_fm['overfit_gap']:.4f})"
-    )
 
-    avg_val_f1 = sum(fm["val_f1_macro"] for fm in result["folds_metrics"]) / len(
-        result["folds_metrics"]
-    )
-    print(f"평균 Val F1(macro): {avg_val_f1:.4f}")
+    if mode == "regressor":
+        print(
+            f"선택 Fold: {result['best_fold_idx']} "
+            f"(Val IC: {result['best_val_f1']:.4f}, "
+            f"gap: {selected_fm['overfit_gap']:.4f})"
+        )
+        avg_val_ic = sum(fm["val_f1_macro"] for fm in result["folds_metrics"]) / len(
+            result["folds_metrics"]
+        )
+        print(f"평균 Val IC: {avg_val_ic:.4f}")
+    else:
+        print(
+            f"선택 Fold: {result['best_fold_idx']} "
+            f"(Val F1: {result['best_val_f1']:.4f}, "
+            f"gap: {selected_fm['overfit_gap']:.4f})"
+        )
+        avg_val_f1 = sum(fm["val_f1_macro"] for fm in result["folds_metrics"]) / len(
+            result["folds_metrics"]
+        )
+        print(f"평균 Val F1(macro): {avg_val_f1:.4f}")
     print(f"과적합 fold: {overfit_count}/{total_folds}")
 
     print(f"\n모델 저장: {model_path}")

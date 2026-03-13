@@ -2,6 +2,7 @@
 
 확장 윈도우 방식으로 시계열 데이터를 분할하고,
 LightGBM 모델을 학습/검증한다.
+분류(classifier)와 회귀(regressor) 모드를 지원한다.
 """
 
 import json
@@ -13,6 +14,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 from sklearn.metrics import f1_score, log_loss
 
 from src.utils.logger import setup_logger
@@ -33,7 +35,7 @@ class WalkForwardTrainer:
         n_optuna_trials: Optuna 시행 횟수.
     """
 
-    # LightGBM 고정 파라미터
+    # LightGBM 분류 고정 파라미터
     FIXED_PARAMS: dict[str, Any] = {
         "boosting_type": "gbdt",
         "objective": "binary",
@@ -47,8 +49,23 @@ class WalkForwardTrainer:
         "deterministic": True,
     }
 
+    # LightGBM 회귀 고정 파라미터
+    REGRESSOR_FIXED_PARAMS: dict[str, Any] = {
+        "boosting_type": "gbdt",
+        "objective": "huber",           # 이상치에 강건
+        "metric": "mae",
+        "n_estimators": 2000,
+        "bagging_freq": 1,
+        "max_depth": -1,
+        "verbose": -1,
+        "seed": 42,
+        "deterministic": True,
+        "huber_delta": 1.0,
+    }
+
     def __init__(
         self,
+        mode: str = "classifier",
         min_train_months: int = 6,
         val_months: int = 1,
         embargo_bars: int = 24,
@@ -60,14 +77,16 @@ class WalkForwardTrainer:
         """WalkForwardTrainer 초기화.
 
         Args:
+            mode: 모델 유형 — "classifier" 또는 "regressor".
             min_train_months: 최소 학습 데이터 기간 (월).
             val_months: 각 fold의 검증 기간 (월).
             embargo_bars: 학습 끝~검증 시작 사이 제거할 봉 수.
             n_optuna_trials: Optuna 하이퍼파라미터 탐색 시행 수.
-            max_overfit_gap: 모델 후보 제외 기준 과적합 갭 (train_f1 - val_f1).
+            max_overfit_gap: 모델 후보 제외 기준 과적합 갭.
             use_sliding_window: True면 슬라이딩 윈도우, False면 확장 윈도우.
             sliding_window_months: 슬라이딩 윈도우 시 학습 데이터 최대 기간 (월).
         """
+        self.mode = mode
         self.min_train_months = min_train_months
         self.val_months = val_months
         self.embargo_bars = embargo_bars
@@ -151,13 +170,25 @@ class WalkForwardTrainer:
 
         Args:
             X_train: 학습 피처.
-            y_train: 학습 라벨 (0, 1, 2).
+            y_train: 학습 라벨.
             X_val: 검증 피처.
             y_val: 검증 라벨.
 
         Returns:
             최적 하이퍼파라미터 딕셔너리.
         """
+        if self.mode == "regressor":
+            return self._optimize_regressor(X_train, y_train, X_val, y_val)
+        return self._optimize_classifier(X_train, y_train, X_val, y_val)
+
+    def _optimize_classifier(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+    ) -> dict:
+        """Optuna 분류 모드 하이퍼파라미터 탐색."""
         import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -199,6 +230,65 @@ class WalkForwardTrainer:
 
         return best_params
 
+    def _optimize_regressor(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+    ) -> dict:
+        """Optuna 회귀 모드 하이퍼파라미터 탐색.
+
+        목적함수: val_ic - 0.5 * max(mae_gap - 0.002, 0)
+          — IC 최대화 + 과적합 페널티.
+        """
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                **self.REGRESSOR_FIXED_PARAMS,
+                "num_leaves": trial.suggest_int("num_leaves", 8, 31),
+                "min_child_samples": trial.suggest_int("min_child_samples", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 10.0, log=True),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.3, 0.8),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.9),
+                "huber_delta": trial.suggest_float("huber_delta", 0.5, 2.0),
+                "max_depth": trial.suggest_int("max_depth", 3, 6),
+            }
+
+            model = lgb.LGBMRegressor(**params)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            )
+
+            pred_train = model.predict(X_train)
+            pred_val = model.predict(X_val)
+
+            val_ic, _ = spearmanr(pred_val, y_val)
+            if np.isnan(val_ic):
+                return -1.0
+
+            train_mae = np.mean(np.abs(pred_train - y_train))
+            val_mae = np.mean(np.abs(pred_val - y_val))
+            mae_gap = val_mae - train_mae
+
+            return val_ic - 0.5 * max(mae_gap - 0.002, 0)
+
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=self.n_optuna_trials)
+
+        best_params = {**self.REGRESSOR_FIXED_PARAMS, **study.best_params}
+        logger.info(f"Optuna 최적 IC: {study.best_value:.4f}")
+        logger.info(f"최적 파라미터: {study.best_params}")
+
+        return best_params
+
     def train_fold(
         self,
         X_train: pd.DataFrame,
@@ -206,7 +296,7 @@ class WalkForwardTrainer:
         X_val: pd.DataFrame,
         y_val: pd.Series,
         params: dict,
-    ) -> tuple[lgb.LGBMClassifier, dict]:
+    ) -> tuple:
         """단일 fold 학습.
 
         Args:
@@ -219,6 +309,19 @@ class WalkForwardTrainer:
         Returns:
             (학습된 모델, fold 성과 딕셔너리).
         """
+        if self.mode == "regressor":
+            return self._train_fold_regressor(X_train, y_train, X_val, y_val, params)
+        return self._train_fold_classifier(X_train, y_train, X_val, y_val, params)
+
+    def _train_fold_classifier(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        params: dict,
+    ) -> tuple[lgb.LGBMClassifier, dict]:
+        """분류 fold 학습."""
         model = lgb.LGBMClassifier(**params)
         model.fit(
             X_train, y_train,
@@ -246,6 +349,64 @@ class WalkForwardTrainer:
         logger.info(
             f"  Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f} | "
             f"Val LogLoss: {val_logloss:.4f}"
+        )
+
+        return model, fold_metrics
+
+    def _train_fold_regressor(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        params: dict,
+    ) -> tuple[lgb.LGBMRegressor, dict]:
+        """회귀 fold 학습.
+
+        평가 메트릭: MAE, IC (Spearman 상관), Directional Accuracy.
+        """
+        model = lgb.LGBMRegressor(**params)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+        )
+
+        pred_train = model.predict(X_train)
+        pred_val = model.predict(X_val)
+
+        # MAE
+        train_mae = np.mean(np.abs(pred_train - y_train))
+        val_mae = np.mean(np.abs(pred_val - y_val))
+
+        # IC (Spearman 상관)
+        train_ic, _ = spearmanr(pred_train, y_train)
+        val_ic, _ = spearmanr(pred_val, y_val)
+
+        # Directional Accuracy (예측 부호 vs 실제 부호 일치율)
+        train_dir_acc = np.mean(np.sign(pred_train) == np.sign(y_train.values))
+        val_dir_acc = np.mean(np.sign(pred_val) == np.sign(y_val.values))
+
+        fold_metrics = {
+            "train_mae": float(train_mae),
+            "val_mae": float(val_mae),
+            "train_ic": float(train_ic) if not np.isnan(train_ic) else 0.0,
+            "val_ic": float(val_ic) if not np.isnan(val_ic) else 0.0,
+            "train_dir_acc": float(train_dir_acc),
+            "val_dir_acc": float(val_dir_acc),
+            "n_train": len(X_train),
+            "n_val": len(X_val),
+            "best_iteration": model.best_iteration_ if hasattr(model, "best_iteration_") else -1,
+            # 하위 호환: run()에서 참조하는 키 맞추기
+            "train_f1_macro": float(train_ic) if not np.isnan(train_ic) else 0.0,
+            "val_f1_macro": float(val_ic) if not np.isnan(val_ic) else 0.0,
+            "val_logloss": float(val_mae),
+        }
+
+        logger.info(
+            f"  Train MAE: {train_mae:.6f} | Val MAE: {val_mae:.6f} | "
+            f"Train IC: {train_ic:.4f} | Val IC: {val_ic:.4f} | "
+            f"Val DirAcc: {val_dir_acc:.4f}"
         )
 
         return model, fold_metrics
@@ -281,12 +442,27 @@ class WalkForwardTrainer:
         X_val_0 = df.loc[first_fold["val_idx"], feature_names]
         y_val_0 = df.loc[first_fold["val_idx"], label_col]
 
+        base_params = self.REGRESSOR_FIXED_PARAMS if self.mode == "regressor" else self.FIXED_PARAMS
+
         if override_params:
-            best_params = {**self.FIXED_PARAMS, **override_params}
+            best_params = {**base_params, **override_params}
             logger.info(f"외부 파라미터 사용: {len(override_params)}개 키")
         elif self.n_optuna_trials > 0:
             logger.info(f"Fold 0: Optuna 튜닝 ({self.n_optuna_trials} trials)...")
             best_params = self.optimize_hyperparams(X_train_0, y_train_0, X_val_0, y_val_0)
+        elif self.mode == "regressor":
+            best_params = {
+                **self.REGRESSOR_FIXED_PARAMS,
+                "num_leaves": 15,
+                "min_child_samples": 150,
+                "learning_rate": 0.02,
+                "reg_alpha": 3.0,
+                "reg_lambda": 5.0,
+                "feature_fraction": 0.5,
+                "bagging_fraction": 0.7,
+                "max_depth": 4,
+                "n_estimators": 200,
+            }
         else:
             best_params = {
                 **self.FIXED_PARAMS,
@@ -303,7 +479,7 @@ class WalkForwardTrainer:
 
         # 모든 fold에서 학습
         folds_metrics = []
-        fold_models: list[lgb.LGBMClassifier] = []
+        fold_models = []
 
         for i, fold in enumerate(folds):
             logger.info(
@@ -343,8 +519,9 @@ class WalkForwardTrainer:
         selected_model = None
         selected_fold_idx = -1
 
-        MIN_VAL_F1 = 0.40
-        MIN_TRAIN_F1 = 0.01  # 학습 실패 제외 기준
+        # 회귀 모드에서는 IC 기준 (0.01 이상이면 유의미)
+        MIN_VAL_F1 = 0.01 if self.mode == "regressor" else 0.40
+        MIN_TRAIN_F1 = 0.001 if self.mode == "regressor" else 0.01
 
         # 유효 fold 필터링: 학습 성공 + gap ≤ threshold + Val F1 ≥ 최소 기준
         eligible = [
@@ -355,15 +532,17 @@ class WalkForwardTrainer:
             and folds_metrics[i]["val_f1_macro"] >= MIN_VAL_F1
         ]
 
+        metric_name = "Val IC" if self.mode == "regressor" else "Val F1"
+
         if eligible:
             # 최신 fold 우선 (더 많은 학습 데이터 + 최근 패턴),
-            # 동점이면 Val F1 높은 쪽 우선
+            # 동점이면 Val 메트릭 높은 쪽 우선
             best = max(eligible, key=lambda x: (x[0], x[1]))
             selected_fold_idx = best[0]
             selected_model = fold_models[selected_fold_idx]
             logger.info(
                 f"모델 선택: Fold {selected_fold_idx} "
-                f"(Val F1: {best[1]:.4f}, gap: {best[2]:.4f}) "
+                f"({metric_name}: {best[1]:.4f}, gap: {best[2]:.4f}) "
                 f"— {len(eligible)}개 적합 fold 중 최신 fold"
             )
         else:
@@ -381,7 +560,7 @@ class WalkForwardTrainer:
             selected_model = fold_models[selected_fold_idx]
             logger.warning(
                 f"적합 fold 없음 — Fold {selected_fold_idx} 사용 "
-                f"(gap: {best[2]:.4f}, Val F1: {best[1]:.4f})"
+                f"(gap: {best[2]:.4f}, {metric_name}: {best[1]:.4f})"
             )
 
         selected_val_f1 = folds_metrics[selected_fold_idx]["val_f1_macro"]
@@ -405,7 +584,7 @@ class WalkForwardTrainer:
 
     def save_model(
         self,
-        model: lgb.LGBMClassifier,
+        model,
         params: dict,
         feature_names: list[str],
         folds_metrics: list[dict],
@@ -413,12 +592,12 @@ class WalkForwardTrainer:
         save_dir: str,
         best_fold_idx: int = -1,
         best_val_f1: float = 0.0,
-        fold_models: list[lgb.LGBMClassifier] | None = None,
+        fold_models: list | None = None,
     ) -> str:
         """학습 결과를 atomic write로 저장.
 
         Args:
-            model: 학습된 LGBMClassifier.
+            model: 학습된 LGBMClassifier 또는 LGBMRegressor.
             params: 사용된 하이퍼파라미터.
             feature_names: 피처 이름 목록.
             folds_metrics: fold별 성과.
@@ -448,6 +627,7 @@ class WalkForwardTrainer:
         self._atomic_write_json(params_path, serializable_params)
 
         meta = {
+            "mode": self.mode,
             "n_folds": len(folds_metrics),
             "best_fold_idx": best_fold_idx,
             "best_val_f1": best_val_f1,
