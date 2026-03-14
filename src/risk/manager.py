@@ -228,6 +228,7 @@ class RiskManager:
         atr: float,
         entry_price: float,
         risk_per_trade: Optional[float] = None,
+        max_position_pct: Optional[float] = None,
     ) -> float:
         """ATR 기반 변동성 조절 포지션 사이징.
 
@@ -238,6 +239,8 @@ class RiskManager:
             atr: 현재 ATR 값.
             entry_price: 진입 가격 (max_position_pct 상한을 수량 단위로 변환에 사용).
             risk_per_trade: 거래당 위험 비율. None이면 설정 파일 기본값 사용.
+            max_position_pct: 포트폴리오 대비 최대 포지션 비율 오버라이드.
+                None이거나 0이면 config 기본값(position.max_position_pct) 사용.
 
         Returns:
             계산된 포지션 사이즈 (수량 단위).
@@ -250,7 +253,12 @@ class RiskManager:
             return 0.0
         position_size = dollar_risk / atr
 
-        max_size_usd = portfolio_value * self.params["position"]["max_position_pct"]
+        effective_max_pct = (
+            max_position_pct
+            if max_position_pct is not None and max_position_pct > 0
+            else self.params["position"]["max_position_pct"]
+        )
+        max_size_usd = portfolio_value * effective_max_pct
         max_size_qty = max_size_usd / entry_price
         return min(position_size, max_size_qty)
 

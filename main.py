@@ -490,6 +490,44 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
         sym_raw = cfg.get("strategy", {}).get("symbol", "BTCUSDT")
         v1_perp_symbols.add(_convert_symbol(sym_raw))
 
+    # === Hedge Mode (Both Sides) 설정 ===
+    # Hedge Mode에서는 같은 심볼에 롱(positionIdx=1)과 숏(positionIdx=2)을 동시 보유 가능.
+    # v1 전략은 positionIdx=1(Buy side), funding_arb는 positionIdx=2(Sell side)로 분리.
+    hedge_mode_enabled = False
+    hedge_mode_symbols: set[str] = set()
+
+    arb_config_tmp = _load_funding_arb_config(portfolio_config)
+    if arb_config_tmp:
+        arb_symbols_tmp = arb_config_tmp.get("strategy", {}).get("symbols", [])
+        # v1과 겹치는 심볼에 대해 Hedge Mode 전환 시도
+        hedge_mode_symbols = {s["perp"] for s in arb_symbols_tmp if s["perp"] in v1_perp_symbols}
+
+        if hedge_mode_symbols:
+            all_success = True
+            for sym in hedge_mode_symbols:
+                try:
+                    exchange.set_position_mode(True, sym)
+                    logger.info(f"Hedge Mode 전환 성공: {sym}")
+                except Exception as e:
+                    err_msg = str(e)
+                    # 이미 Hedge Mode인 경우도 성공으로 처리
+                    if "already" in err_msg.lower() or "position mode is not modified" in err_msg.lower():
+                        logger.info(f"Hedge Mode 이미 활성: {sym}")
+                    else:
+                        logger.warning(f"Hedge Mode 전환 실패: {sym} — {e}")
+                        all_success = False
+
+            if all_success:
+                hedge_mode_enabled = True
+                logger.info(
+                    f"Hedge Mode 활성화 완료: {hedge_mode_symbols} — "
+                    f"v1(positionIdx=1)과 arb(positionIdx=2) 동시 운용 가능"
+                )
+            else:
+                logger.warning(
+                    "Hedge Mode 전환 실패 — One-Way Mode + 하드 가드 유지"
+                )
+
     # === 펀딩비 차익거래 초기화 ===
     arb_executor = None
     arb_config = None
@@ -500,19 +538,29 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     arb_config = _load_funding_arb_config(portfolio_config)
     if arb_config:
         arb_symbols = arb_config.get("strategy", {}).get("symbols", [])
-        blocked = [s["perp"] for s in arb_symbols if s["perp"] in v1_perp_symbols]
-        filtered = [s for s in arb_symbols if s["perp"] not in v1_perp_symbols]
 
-        if blocked:
-            logger.warning(
-                f"funding_arb 심볼 충돌 차단: {blocked} "
-                f"(v1 전략과 동일 perp 심볼 — NET 포지션 모드 충돌 방지)"
-            )
-            if not filtered:
-                logger.warning(
-                    "funding_arb 전체 심볼이 v1 전략과 충돌 — "
-                    "차익거래 비활성화 (별도 서브계정 사용 권장)"
+        if hedge_mode_enabled:
+            # Hedge Mode에서는 v1과 동일 심볼도 허용
+            filtered = arb_symbols
+            if hedge_mode_symbols & v1_perp_symbols:
+                logger.info(
+                    f"Hedge Mode: v1 충돌 심볼 허용 — {hedge_mode_symbols & v1_perp_symbols}"
                 )
+        else:
+            # One-Way Mode 폴백: 기존 하드 가드 유지
+            blocked = [s["perp"] for s in arb_symbols if s["perp"] in v1_perp_symbols]
+            filtered = [s for s in arb_symbols if s["perp"] not in v1_perp_symbols]
+
+            if blocked:
+                logger.warning(
+                    f"funding_arb 심볼 충돌 차단: {blocked} "
+                    f"(v1 전략과 동일 perp 심볼 — NET 포지션 모드 충돌 방지)"
+                )
+                if not filtered:
+                    logger.warning(
+                        "funding_arb 전체 심볼이 v1 전략과 충돌 — "
+                        "차익거래 비활성화 (별도 서브계정 사용 권장)"
+                    )
         arb_config["strategy"]["symbols"] = filtered
 
     if arb_config and arb_config.get("strategy", {}).get("symbols"):
@@ -944,6 +992,8 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     sl, tp = info["sl"], info["tp"]
 
                 for delta in deltas:
+                    # Hedge Mode: v1 전략은 positionIdx=1(Buy side)
+                    v1_pos_idx = 1 if (hedge_mode_enabled and delta["symbol"] in hedge_mode_symbols) else None
                     exec_order = executor.execute(
                         symbol=delta["symbol"],
                         side=delta["side"],
@@ -954,6 +1004,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         signal_score=info["signal"],
                         stop_loss=sl,
                         take_profit=tp,
+                        position_idx=v1_pos_idx,
                     )
 
                     if exec_order:

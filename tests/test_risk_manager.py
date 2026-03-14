@@ -306,6 +306,65 @@ class TestRiskManager(unittest.TestCase):
         )
         self.assertEqual(size, 0.0)
 
+    def test_atr_position_size_with_max_pct_override(self) -> None:
+        """max_position_pct=0.20 → config 5% 대신 20% 캡 적용 검증."""
+        size = self.rm.calculate_atr_position_size(
+            portfolio_value=100_000,
+            atr=1_500,
+            entry_price=80_000,
+            max_position_pct=0.20,
+        )
+        # max_size_usd = 100000 * 0.20 = 20000, max_qty = 20000/80000 = 0.25
+        # atr_qty = 100000 * 0.01 / 1500 = 0.6667
+        # final = min(0.6667, 0.25) = 0.25
+        expected = 100_000 * 0.20 / 80_000  # 0.25
+        self.assertAlmostEqual(size, expected, places=6)
+
+    def test_atr_position_size_override_none_uses_config(self) -> None:
+        """max_position_pct=None → 기존 config 5% 사용 (하위 호환) 검증."""
+        size_none = self.rm.calculate_atr_position_size(
+            portfolio_value=100_000,
+            atr=1_500,
+            entry_price=80_000,
+            max_position_pct=None,
+        )
+        size_default = self.rm.calculate_atr_position_size(
+            portfolio_value=100_000,
+            atr=1_500,
+            entry_price=80_000,
+        )
+        self.assertAlmostEqual(size_none, size_default, places=6)
+        # config 5% 캡: 100000 * 0.05 / 80000 = 0.0625
+        expected = 100_000 * 0.05 / 80_000
+        self.assertAlmostEqual(size_none, expected, places=6)
+
+    def test_atr_position_size_override_zero_uses_config(self) -> None:
+        """max_position_pct=0 → config fallback 검증."""
+        size_zero = self.rm.calculate_atr_position_size(
+            portfolio_value=100_000,
+            atr=1_500,
+            entry_price=80_000,
+            max_position_pct=0,
+        )
+        expected = 100_000 * 0.05 / 80_000  # config 5%
+        self.assertAlmostEqual(size_zero, expected, places=6)
+
+    def test_atr_still_caps_when_smaller_than_size_pct(self) -> None:
+        """ATR qty < size_pct qty → ATR이 리스크 가드로 작동하는지 검증."""
+        # atr_qty = 100000 * 0.01 / 5000 = 0.2
+        # max_qty(20%) = 100000 * 0.20 / 50000 = 0.4
+        # final = min(0.2, 0.4) = 0.2 → ATR이 제한
+        size = self.rm.calculate_atr_position_size(
+            portfolio_value=100_000,
+            atr=5_000,
+            entry_price=50_000,
+            max_position_pct=0.20,
+        )
+        atr_qty = 100_000 * 0.01 / 5_000  # 0.2
+        max_qty = 100_000 * 0.20 / 50_000  # 0.4
+        self.assertAlmostEqual(size, atr_qty, places=6)
+        self.assertLess(size, max_qty)
+
 
 if __name__ == "__main__":
     unittest.main()

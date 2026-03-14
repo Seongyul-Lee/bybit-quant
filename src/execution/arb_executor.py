@@ -75,7 +75,7 @@ class ArbExecutor:
             "entry_time": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Step 1: 선물 숏
+        # Step 1: 선물 숏 (Hedge Mode: positionIdx=2 = Sell side)
         perp_order = self.perp.execute(
             symbol=symbol_perp,
             side="sell",
@@ -83,6 +83,7 @@ class ArbExecutor:
             order_type="market",
             strategy_name="funding_arb",
             signal_score=0,
+            position_idx=2,
         )
         if not perp_order:
             logger.error("선물 숏 실패 — 진입 중단")
@@ -97,7 +98,7 @@ class ArbExecutor:
         )
         if not spot_order:
             logger.error("현물 매수 실패 — 선물 숏 롤백")
-            # 롤백: 선물 숏 청산
+            # 롤백: 선물 숏 청산 (Hedge Mode: positionIdx=2)
             self.perp.execute(
                 symbol=symbol_perp,
                 side="buy",
@@ -105,6 +106,7 @@ class ArbExecutor:
                 order_type="market",
                 strategy_name="funding_arb_rollback",
                 signal_score=0,
+                position_idx=2,
             )
             return result
         result["spot_order"] = spot_order
@@ -175,7 +177,7 @@ class ArbExecutor:
             return result
         result["spot_order"] = spot_order
 
-        # Step 2: 선물 숏 청산 (buy)
+        # Step 2: 선물 숏 청산 (buy, Hedge Mode: positionIdx=2)
         perp_order = self.perp.execute(
             symbol=symbol_perp,
             side="buy",
@@ -183,6 +185,7 @@ class ArbExecutor:
             order_type="market",
             strategy_name="funding_arb_close",
             signal_score=0,
+            position_idx=2,
         )
         if not perp_order:
             logger.error("선물 청산 실패 — 수동 청산 필요")
@@ -233,7 +236,9 @@ class ArbExecutor:
         spot_balance = self.spot.get_balance(coin)
 
         positions = self.perp.sync_positions()
-        perp_pos = positions.get(symbol_perp, {})
+        # Hedge Mode: positionIdx=2 키(symbol::2) 우선, 없으면 기본 키
+        perp_key = f"{symbol_perp}::2"
+        perp_pos = positions.get(perp_key, positions.get(symbol_perp, {}))
         perp_size = abs(float(perp_pos.get("size", 0)))
 
         return spot_balance - perp_size
