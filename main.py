@@ -211,6 +211,7 @@ def _run_funding_arb_check(
     notifier,
     state: dict,
     log_prefix: str,
+    arb_risk_monitor=None,
 ) -> None:
     """펀딩비 차익거래 상태 체크 + 관리.
 
@@ -218,7 +219,7 @@ def _run_funding_arb_check(
 
     로직:
     1. 포지션이 없으면 → 진입 (Buy & Hold)
-    2. 포지션이 있으면 → 델타 체크
+    2. 포지션이 있으면 → 델타 체크 + 리스크 체크
     3. 한쪽만 있으면 → 비정상 알림
 
     Args:
@@ -228,6 +229,7 @@ def _run_funding_arb_check(
         notifier: TelegramNotifier 인스턴스.
         state: 현재 상태 딕셔너리 (funding_arb 키 포함).
         log_prefix: 로그 접두사 (예: "[TESTNET] ").
+        arb_risk_monitor: ArbRiskMonitor 인스턴스 (None이면 리스크 체크 스킵).
     """
     symbols = arb_config.get("strategy", {}).get("symbols", [])
     params = arb_config.get("params", {})
@@ -314,6 +316,39 @@ def _run_funding_arb_check(
                     f"[펀딩비 차익] {coin} 정상: delta={delta:.6f} ({delta_pct:.1%})"
                 )
 
+            # === 리스크 체크 (ArbRiskMonitor) ===
+            if arb_risk_monitor:
+                try:
+                    spot_price = arb_executor.spot.get_spot_price(symbol_spot)
+                    perp_ticker = arb_executor.perp.exchange.fetch_ticker(symbol_perp)
+                    perp_price = float(perp_ticker["last"]) if perp_ticker else 0
+
+                    if spot_price > 0 and perp_price > 0:
+                        basis_result = arb_risk_monitor.check_basis(spot_price, perp_price)
+                        if basis_result["level"] == "critical":
+                            if arb_risk_monitor.should_send_alert("basis", "critical"):
+                                notifier.send_sync(
+                                    f"{log_prefix}[펀딩비 차익] ⚠️ {basis_result['message']}"
+                                )
+                        elif basis_result["level"] == "warn":
+                            logger.warning(f"[펀딩비 차익] {basis_result['message']}")
+
+                    margin_result = arb_risk_monitor.check_margin(
+                        arb_executor.perp.exchange, symbol_perp
+                    )
+                    if margin_result["level"] == "critical":
+                        if arb_risk_monitor.should_send_alert("margin", "critical"):
+                            notifier.send_sync(
+                                f"{log_prefix}[펀딩비 차익] 🚨 {margin_result['message']}"
+                            )
+                    elif margin_result["level"] == "warn":
+                        if arb_risk_monitor.should_send_alert("margin", "warn"):
+                            notifier.send_sync(
+                                f"{log_prefix}[펀딩비 차익] ⚠️ {margin_result['message']}"
+                            )
+                except Exception as e:
+                    logger.warning(f"[펀딩비 차익] 리스크 체크 오류 ({coin}): {e}")
+
         else:
             # 한쪽만 있음 → 비정상
             msg = (
@@ -331,6 +366,7 @@ def _check_funding_settlement(
     last_check_time: datetime,
     state: dict,
     log_prefix: str,
+    arb_risk_monitor=None,
 ) -> datetime:
     """펀딩비 결제 확인.
 
@@ -343,6 +379,7 @@ def _check_funding_settlement(
         last_check_time: 마지막 결제 확인 시간.
         state: 현재 상태 (funding_arb 키 포함).
         log_prefix: 로그 접두사.
+        arb_risk_monitor: ArbRiskMonitor 인스턴스 (None이면 추세 체크 스킵).
 
     Returns:
         업데이트된 마지막 확인 시간.
@@ -369,6 +406,19 @@ def _check_funding_settlement(
                 pos_info.get("total_funding_collected", 0.0) + income
             )
             funding_msgs.append(f"{coin} {income:+.4f} USDT")
+
+            # 펀딩비 추세 체크
+            if arb_risk_monitor:
+                trend = arb_risk_monitor.check_funding_trend(income)
+                if trend["level"] == "critical":
+                    notifier.send_sync(
+                        f"{log_prefix}[펀딩비 차익] 🚨 {trend['message']} — 수동 청산 검토"
+                    )
+                elif trend["level"] == "warn":
+                    if arb_risk_monitor.should_send_alert("funding_trend", "warn"):
+                        notifier.send_sync(
+                            f"{log_prefix}[펀딩비 차익] ⚠️ {trend['message']}"
+                        )
 
     if funding_msgs:
         msg = f"{log_prefix}[펀딩비] 결제 확인: {', '.join(funding_msgs)}"
@@ -425,6 +475,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     # === 펀딩비 차익거래 초기화 ===
     arb_executor = None
     arb_config = None
+    arb_risk_monitor = None
     funding_arb_state: dict = {}
     last_funding_check = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
@@ -433,9 +484,11 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
         try:
             from src.execution.spot_executor import SpotExecutor
             from src.execution.arb_executor import ArbExecutor
+            from src.risk.arb_monitor import ArbRiskMonitor
 
             spot_executor = SpotExecutor(testnet=testnet)
             arb_executor = ArbExecutor(spot_executor, executor)
+            arb_risk_monitor = ArbRiskMonitor(arb_config.get("risk", {}))
 
             # 차익거래 심볼에도 레버리지 설정
             arb_leverage = arb_config.get("params", {}).get("leverage", 2)
@@ -494,6 +547,9 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     if arb_executor and "funding_arb" in saved_state:
         funding_arb_state = saved_state["funding_arb"]
         logger.info(f"펀딩비 차익거래 상태 복원: {list(funding_arb_state.keys())}")
+    if arb_risk_monitor and "arb_risk_monitor" in saved_state:
+        arb_risk_monitor.from_dict(saved_state["arb_risk_monitor"])
+        logger.info("ArbRiskMonitor 상태 복원")
 
     # 5. 거래소 포지션 동기화
     logger.info("시작 시 거래소 포지션 동기화...")
@@ -541,6 +597,8 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
         }
         if arb_executor:
             extra["funding_arb"] = funding_arb_state
+        if arb_risk_monitor:
+            extra["arb_risk_monitor"] = arb_risk_monitor.to_dict()
         executor._save_state(prev_positions, extra_state=extra, state_path=state_path)
 
     while True:
@@ -578,10 +636,12 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         _run_funding_arb_check(
                             arb_executor, arb_config, pv,
                             notifier, funding_arb_state, log_prefix,
+                            arb_risk_monitor,
                         )
                         last_funding_check = _check_funding_settlement(
                             arb_executor, notifier, last_funding_check,
                             funding_arb_state, log_prefix,
+                            arb_risk_monitor,
                         )
                         _save_current_state()
                     except Exception as e:
@@ -803,10 +863,12 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     _run_funding_arb_check(
                         arb_executor, arb_config, portfolio_value,
                         notifier, funding_arb_state, log_prefix,
+                        arb_risk_monitor,
                     )
                     last_funding_check = _check_funding_settlement(
                         arb_executor, notifier, last_funding_check,
                         funding_arb_state, log_prefix,
+                        arb_risk_monitor,
                     )
                 except Exception as e:
                     logger.error(f"차익거래 체크 오류: {e}", exc_info=True)

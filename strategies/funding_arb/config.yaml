@@ -28,3 +28,20 @@ execution:
 
 risk:
   max_position_pct: 0.40
+
+  # 베이시스 모니터링
+  basis_warn_pct: 0.01              # 베이시스 ±1% → 경고
+  basis_critical_pct: 0.02          # 베이시스 ±2% → 긴급
+
+  # 마진율 모니터링
+  margin_warn_pct: 0.50             # 마진 여유 50% 미만 → 경고
+  margin_critical_pct: 0.30         # 마진 여유 30% 미만 → 긴급
+
+  # 펀딩비 추세
+  max_consecutive_negative: 6       # 연속 음수 6회(48시간) → 긴급
+
+  # 슬리피지
+  max_entry_slippage_pct: 0.005     # 진입 슬리피지 0.5% 초과 → 경고
+
+  # 누적 손실
+  max_cumulative_loss_pct: 0.03     # 누적 음수 펀딩비 3% 초과 → 경고

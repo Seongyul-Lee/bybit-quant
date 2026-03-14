@@ -114,6 +114,21 @@ class ArbExecutor:
         result["delta"] = delta
         result["success"] = True
 
+        # Step 3 확장: 체결 가격 검증
+        spot_fill = self._extract_fill_price(spot_order)
+        perp_fill = self._extract_fill_price(perp_order)
+        result["spot_fill_price"] = spot_fill
+        result["perp_fill_price"] = perp_fill
+
+        if spot_fill > 0 and perp_fill > 0:
+            slippage_pct = (spot_fill - perp_fill) / spot_fill
+            result["entry_slippage_pct"] = slippage_pct
+            if abs(slippage_pct) > 0.005:
+                logger.warning(
+                    f"진입 슬리피지 경고: {slippage_pct:+.2%} "
+                    f"(현물 {spot_fill:.2f} / 선물 {perp_fill:.2f})"
+                )
+
         coin = symbol_spot.split("/")[0]
         logger.info(
             f"차익거래 진입 완료: {coin} 현물 {amount} + 선물 숏 {amount} "
@@ -178,6 +193,27 @@ class ArbExecutor:
         coin = symbol_spot.split("/")[0]
         logger.info(f"차익거래 청산 완료: {coin} {amount}")
         return result
+
+    def _extract_fill_price(self, order: dict) -> float:
+        """주문에서 체결 가격 추출.
+
+        ccxt 주문 결과에서 average(평균 체결가) 또는 price를 반환.
+
+        Args:
+            order: ccxt 주문 결과 딕셔너리.
+
+        Returns:
+            체결 가격. 추출 불가 시 0.0.
+        """
+        if not order:
+            return 0.0
+        avg = order.get("average")
+        if avg and float(avg) > 0:
+            return float(avg)
+        price = order.get("price")
+        if price and float(price) > 0:
+            return float(price)
+        return 0.0
 
     def get_delta(self, symbol_spot: str, symbol_perp: str) -> float:
         """현재 델타 = 현물 보유량 - 선물 숏 수량.
