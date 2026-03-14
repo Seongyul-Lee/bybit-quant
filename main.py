@@ -62,6 +62,9 @@ def load_strategy(strategy_name: str):
     elif strategy_name == "btc_1h_mean_reversion_short":
         from strategies.btc_1h_mean_reversion_short.strategy import BTCMeanReversionShortStrategy
         return BTCMeanReversionShortStrategy(config=config.get("params", {}))
+    elif strategy_name == "funding_arb":
+        from strategies.funding_arb.strategy import FundingArbStrategy
+        return FundingArbStrategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 
@@ -170,6 +173,211 @@ def _load_portfolio_config() -> dict:
     return raw.get("portfolio", raw)
 
 
+def _load_funding_arb_config(portfolio_config: dict) -> dict | None:
+    """펀딩비 차익거래 설정 로드.
+
+    portfolio.yaml의 funding_arb 섹션에서 config_path를 읽어
+    전략 config.yaml을 로드한다.
+
+    Args:
+        portfolio_config: portfolio.yaml의 portfolio 섹션.
+
+    Returns:
+        차익거래 설정 딕셔너리. 비활성화 또는 파일 없으면 None.
+    """
+    arb_section = portfolio_config.get("funding_arb", {})
+    if not arb_section.get("enabled", False):
+        return None
+
+    config_path = arb_section.get("config_path", "strategies/funding_arb/config.yaml")
+    if not os.path.exists(config_path):
+        logger.warning(f"펀딩비 차익거래 설정 파일 없음: {config_path}")
+        return None
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        arb_config = yaml.safe_load(f)
+
+    # portfolio.yaml의 capital_pct를 params에 병합
+    if "params" in arb_config:
+        arb_config["params"]["capital_pct"] = arb_section.get("capital_pct", 0.40)
+
+    return arb_config
+
+
+def _run_funding_arb_check(
+    arb_executor,
+    arb_config: dict,
+    portfolio_value: float,
+    notifier,
+    state: dict,
+    log_prefix: str,
+) -> None:
+    """펀딩비 차익거래 상태 체크 + 관리.
+
+    매 폴링마다 실행 (기존 루프에 통합).
+
+    로직:
+    1. 포지션이 없으면 → 진입 (Buy & Hold)
+    2. 포지션이 있으면 → 델타 체크
+    3. 한쪽만 있으면 → 비정상 알림
+
+    Args:
+        arb_executor: ArbExecutor 인스턴스.
+        arb_config: 차익거래 설정 딕셔너리.
+        portfolio_value: 현재 포트폴리오 가치 (USDT).
+        notifier: TelegramNotifier 인스턴스.
+        state: 현재 상태 딕셔너리 (funding_arb 키 포함).
+        log_prefix: 로그 접두사 (예: "[TESTNET] ").
+    """
+    symbols = arb_config.get("strategy", {}).get("symbols", [])
+    params = arb_config.get("params", {})
+    max_delta_pct = params.get("max_delta_pct", 0.05)
+    rebalance_delta_pct = params.get("rebalance_delta_pct", 0.03)
+    capital_pct = params.get("capital_pct", 0.40)
+
+    if "funding_arb" not in state:
+        state["funding_arb"] = {}
+
+    for sym_pair in symbols:
+        symbol_spot = sym_pair["spot"]
+        symbol_perp = sym_pair["perp"]
+        coin = sym_pair["coin"]
+
+        # 현재 포지션 확인
+        spot_balance = arb_executor.spot.get_balance(coin)
+        has_spot = spot_balance > 0.001 if coin == "BTC" else spot_balance > 0.01
+
+        perp_positions = arb_executor.perp.sync_positions()
+        perp_pos = perp_positions.get(symbol_perp, {})
+        has_perp = perp_pos.get("side") == "short" and float(perp_pos.get("size", 0)) > 0
+
+        if not has_spot and not has_perp:
+            # 포지션 없음 → 진입
+            if portfolio_value <= 0:
+                logger.warning("포트폴리오 가치 0 — 차익거래 진입 불가")
+                continue
+
+            capital_for_arb = portfolio_value * capital_pct
+            spot_price = arb_executor.spot.get_spot_price(symbol_spot)
+            if spot_price <= 0:
+                logger.warning(f"현물 가격 조회 실패 — {coin} 차익거래 진입 스킵")
+                continue
+
+            # 자본의 절반이 현물, 절반이 선물 마진
+            amount = capital_for_arb / spot_price / 2
+
+            logger.info(
+                f"[펀딩비 차익] {coin} 진입 시도: "
+                f"현물 {amount:.6f} + 선물 숏 {amount:.6f}"
+            )
+
+            result = arb_executor.open_position(symbol_spot, symbol_perp, amount)
+
+            if result["success"]:
+                msg = (
+                    f"{log_prefix}[펀딩비 차익] 진입 완료: "
+                    f"{coin} 현물 {amount:.6f} + 선물 숏 {amount:.6f} "
+                    f"(delta={result['delta']:.6f})"
+                )
+                notifier.send_sync(msg)
+                logger.info(msg)
+                state["funding_arb"][coin] = {
+                    "amount": amount,
+                    "entry_time": result["entry_time"],
+                    "entry_price": spot_price,
+                    "total_funding_collected": 0.0,
+                }
+            else:
+                msg = f"{log_prefix}[펀딩비 차익] {coin} 진입 실패"
+                notifier.send_sync(msg)
+                logger.error(msg)
+
+        elif has_spot and has_perp:
+            # 포지션 있음 → 델타 체크
+            delta = arb_executor.get_delta(symbol_spot, symbol_perp)
+            delta_pct = abs(delta) / max(spot_balance, 0.001)
+
+            if delta_pct > max_delta_pct:
+                msg = (
+                    f"{log_prefix}[펀딩비 차익] 델타 초과: "
+                    f"{coin} delta={delta:.6f} ({delta_pct:.1%})"
+                )
+                notifier.send_sync(msg)
+                logger.warning(msg)
+            elif delta_pct > rebalance_delta_pct:
+                logger.info(
+                    f"[펀딩비 차익] 델타 주의: "
+                    f"{coin} delta={delta:.6f} ({delta_pct:.1%})"
+                )
+            else:
+                logger.debug(
+                    f"[펀딩비 차익] {coin} 정상: delta={delta:.6f} ({delta_pct:.1%})"
+                )
+
+        else:
+            # 한쪽만 있음 → 비정상
+            msg = (
+                f"{log_prefix}[펀딩비 차익] 비대칭 포지션: "
+                f"{coin} spot={has_spot} (bal={spot_balance:.6f}), "
+                f"perp={has_perp}"
+            )
+            notifier.send_sync(msg)
+            logger.error(msg)
+
+
+def _check_funding_settlement(
+    arb_executor,
+    notifier,
+    last_check_time: datetime,
+    state: dict,
+    log_prefix: str,
+) -> datetime:
+    """펀딩비 결제 확인.
+
+    UTC 0:00, 8:00, 16:00 이후 10분 내에 1회 실행.
+    Bybit API로 실제 수취 금액을 확인하고 텔레그램으로 알림.
+
+    Args:
+        arb_executor: ArbExecutor 인스턴스.
+        notifier: TelegramNotifier.
+        last_check_time: 마지막 결제 확인 시간.
+        state: 현재 상태 (funding_arb 키 포함).
+        log_prefix: 로그 접두사.
+
+    Returns:
+        업데이트된 마지막 확인 시간.
+    """
+    now = datetime.now(timezone.utc)
+    funding_hours = [0, 8, 16]
+
+    # 현재가 결제 후 10분 이내인지 확인
+    if now.hour not in funding_hours or now.minute >= 10:
+        return last_check_time
+
+    # 중복 체크 방지 (1시간 이내 재확인 방지)
+    if (now - last_check_time).total_seconds() < 3600:
+        return last_check_time
+
+    arb_state = state.get("funding_arb", {})
+    funding_msgs = []
+
+    for coin, pos_info in arb_state.items():
+        symbol_perp = f"{coin}/USDT:USDT"
+        income = arb_executor.get_funding_income(symbol_perp)
+        if income is not None:
+            pos_info["total_funding_collected"] = (
+                pos_info.get("total_funding_collected", 0.0) + income
+            )
+            funding_msgs.append(f"{coin} {income:+.4f} USDT")
+
+    if funding_msgs:
+        msg = f"{log_prefix}[펀딩비] 결제 확인: {', '.join(funding_msgs)}"
+        notifier.send_sync(msg)
+        logger.info(msg)
+
+    return now
+
+
 def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     """실거래 모드 실행.
 
@@ -214,6 +422,41 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     log_prefix = "[TESTNET] " if testnet else ""
     state_path = STATE_PATH_TESTNET if testnet else STATE_PATH_MAINNET
 
+    # === 펀딩비 차익거래 초기화 ===
+    arb_executor = None
+    arb_config = None
+    funding_arb_state: dict = {}
+    last_funding_check = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    arb_config = _load_funding_arb_config(portfolio_config)
+    if arb_config and arb_config.get("strategy", {}).get("symbols"):
+        try:
+            from src.execution.spot_executor import SpotExecutor
+            from src.execution.arb_executor import ArbExecutor
+
+            spot_executor = SpotExecutor(testnet=testnet)
+            arb_executor = ArbExecutor(spot_executor, executor)
+
+            # 차익거래 심볼에도 레버리지 설정
+            arb_leverage = arb_config.get("params", {}).get("leverage", 2)
+            for sym_pair in arb_config["strategy"]["symbols"]:
+                try:
+                    exchange.set_leverage(arb_leverage, sym_pair["perp"])
+                    logger.info(
+                        f"차익거래 레버리지 설정: {arb_leverage}x ({sym_pair['perp']})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"차익거래 레버리지 설정 실패 ({sym_pair['perp']}): {e}"
+                    )
+
+            logger.info("펀딩비 차익거래 모듈 초기화 완료")
+        except Exception as e:
+            logger.error(f"펀딩비 차익거래 초기화 실패: {e}")
+            arb_executor = None
+    else:
+        logger.info("펀딩비 차익거래 비활성화")
+
     # 레버리지 설정
     leverage = risk_manager.params["position"]["max_leverage"]
     # 활성 전략의 심볼 집합
@@ -246,6 +489,11 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
 
     last_processed_bars: dict[str, str] = saved_state.get("last_processed_bars", {})
     last_trade_ids: set = set(saved_state.get("last_trade_ids", []))
+
+    # 펀딩비 차익거래 상태 복원
+    if arb_executor and "funding_arb" in saved_state:
+        funding_arb_state = saved_state["funding_arb"]
+        logger.info(f"펀딩비 차익거래 상태 복원: {list(funding_arb_state.keys())}")
 
     # 5. 거래소 포지션 동기화
     logger.info("시작 시 거래소 포지션 동기화...")
@@ -282,7 +530,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
 
     def _save_current_state() -> None:
         """현재 상태를 atomic write로 저장."""
-        executor._save_state(prev_positions, extra_state={
+        extra = {
             "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
             "pnl_tracker": pnl_tracker.to_dict(),
             "virtual_positions": virtual_tracker.to_dict(),
@@ -290,7 +538,10 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             "peak_value": peak_value,
             "last_processed_bars": last_processed_bars,
             "last_trade_ids": list(last_trade_ids)[-100:],
-        }, state_path=state_path)
+        }
+        if arb_executor:
+            extra["funding_arb"] = funding_arb_state
+        executor._save_state(prev_positions, extra_state=extra, state_path=state_path)
 
     while True:
         try:
@@ -319,6 +570,22 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 last_processed_bars[name] = current_bar
 
             if not data_dict:
+                # v1 데이터 없어도 차익거래 체크는 실행
+                if arb_executor and arb_config:
+                    try:
+                        balance = exchange.fetch_balance()
+                        pv = float(balance.get("total", {}).get("USDT", 0))
+                        _run_funding_arb_check(
+                            arb_executor, arb_config, pv,
+                            notifier, funding_arb_state, log_prefix,
+                        )
+                        last_funding_check = _check_funding_settlement(
+                            arb_executor, notifier, last_funding_check,
+                            funding_arb_state, log_prefix,
+                        )
+                        _save_current_state()
+                    except Exception as e:
+                        logger.error(f"차익거래 체크 오류: {e}", exc_info=True)
                 time.sleep(poll_interval)
                 continue
 
@@ -530,7 +797,21 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         logger.info(msg)
                         notifier.send_sync(msg)
 
-            # 17. 상태 업데이트 및 저장
+            # 17. 펀딩비 차익거래 체크
+            if arb_executor and arb_config:
+                try:
+                    _run_funding_arb_check(
+                        arb_executor, arb_config, portfolio_value,
+                        notifier, funding_arb_state, log_prefix,
+                    )
+                    last_funding_check = _check_funding_settlement(
+                        arb_executor, notifier, last_funding_check,
+                        funding_arb_state, log_prefix,
+                    )
+                except Exception as e:
+                    logger.error(f"차익거래 체크 오류: {e}", exc_info=True)
+
+            # 18. 상태 업데이트 및 저장
             prev_positions = executor.sync_positions()
             _save_current_state()
 

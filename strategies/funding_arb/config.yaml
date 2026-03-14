@@ -1,0 +1,30 @@
+# strategies/funding_arb/config.yaml
+# 펀딩비 차익거래 (Buy & Hold) 전략 설정
+
+strategy:
+  name: funding_arb
+  type: funding_arb
+  symbols:
+    - {spot: "BTC/USDT", perp: "BTC/USDT:USDT", coin: "BTC"}
+    - {spot: "ETH/USDT", perp: "ETH/USDT:USDT", coin: "ETH"}
+
+params:
+  leverage: 2
+  position_pct: 0.40                # 전체 자본의 40%를 차익거래에 배분
+
+  # 델타 모니터링
+  max_delta_pct: 0.05               # 최대 델타 허용 5%
+  rebalance_delta_pct: 0.03         # 델타 3% 초과 시 리밸런스 알림
+
+  # 진입 조건 (Buy & Hold이므로 최소한)
+  min_funding_rate: 0.0             # 음수여도 진입 (B&H)
+
+  # 모니터링 주기
+  check_interval_sec: 300           # 5분마다 상태 체크
+  funding_schedule_utc: [0, 8, 16]
+
+execution:
+  order_type: market                # 현물+선물 동시 실행은 시장가 권장
+
+risk:
+  max_position_pct: 0.40

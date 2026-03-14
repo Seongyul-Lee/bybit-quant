@@ -49,3 +49,9 @@ portfolio:
       enabled: true
       consecutive_wins_to_upgrade: 3
       min_hours_at_level: 24
+
+  # 펀딩비 차익거래 (별도 실행 경로)
+  funding_arb:
+    enabled: true
+    config_path: strategies/funding_arb/config.yaml
+    capital_pct: 0.40               # 전체 자본의 40%
