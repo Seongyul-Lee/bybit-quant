@@ -184,12 +184,12 @@ class OrderExecutor:
             positions = self.exchange.fetch_positions()
             active = {}
             for pos in positions:
-                if float(pos.get("contracts", 0)) > 0:
+                if float(pos.get("contracts") or 0) > 0:
                     active[pos["symbol"]] = {
                         "side": pos["side"],
-                        "size": float(pos["contracts"]),
-                        "entry_price": float(pos.get("entryPrice", 0)),
-                        "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
+                        "size": float(pos.get("contracts") or 0),
+                        "entry_price": float(pos.get("entryPrice") or 0),
+                        "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
                     }
 
             # 미체결 주문 갱신
