@@ -47,6 +47,7 @@ class WalkForwardTrainer:
         "verbose": -1,
         "seed": 42,
         "deterministic": True,
+        "num_threads": 1,
     }
 
     # LightGBM 회귀 고정 파라미터
@@ -60,6 +61,7 @@ class WalkForwardTrainer:
         "verbose": -1,
         "seed": 42,
         "deterministic": True,
+        "num_threads": 1,
         "huber_delta": 1.0,
     }
 

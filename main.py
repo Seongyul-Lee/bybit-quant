@@ -53,6 +53,15 @@ def load_strategy(strategy_name: str):
     elif strategy_name == "btc_1h_mean_reversion_v2":
         from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
         return BTCMeanReversionV2Strategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_momentum_short":
+        from strategies.btc_1h_momentum_short.strategy import BTCMomentumShortStrategy
+        return BTCMomentumShortStrategy(config=config.get("params", {}))
+    elif strategy_name == "eth_1h_momentum_short":
+        from strategies.eth_1h_momentum_short.strategy import ETHMomentumShortStrategy
+        return ETHMomentumShortStrategy(config=config.get("params", {}))
+    elif strategy_name == "btc_1h_mean_reversion_short":
+        from strategies.btc_1h_mean_reversion_short.strategy import BTCMeanReversionShortStrategy
+        return BTCMeanReversionShortStrategy(config=config.get("params", {}))
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 
@@ -353,8 +362,8 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 if sig[0] == 0:
                     logger.info(f"{name}: 신호 중립 — 대기")
 
-            # 매수 시그널이 없으면 상태 저장 후 다음 루프
-            if not any(sig == 1 for sig, _ in signals.values()):
+            # 활성 시그널이 없으면 상태 저장 후 다음 루프
+            if not any(sig != 0 for sig, _ in signals.values()):
                 prev_positions = positions
                 _save_current_state()
                 time.sleep(poll_interval)
@@ -422,6 +431,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 strat_name = order["strategy"]
                 sym = order["symbol"]
                 cfg = portfolio_manager.get_strategy_config(strat_name)
+                direction = order.get("direction", "long")
 
                 # 데이터에서 진입 가격 가져오기
                 df = data_dict.get(strat_name)
@@ -429,11 +439,11 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     continue
                 entry_price = float(df["close"].iloc[-1])
 
-                # 기존 포지션 체크
+                # 기존 포지션 체크: 같은 방향이면 스킵
                 existing_pos = positions.get(sym)
                 if existing_pos:
-                    if existing_pos["side"] == "long":
-                        logger.info(f"이미 {sym} long 포지션 보유 — 스킵")
+                    if existing_pos["side"] == direction:
+                        logger.info(f"이미 {sym} {direction} 포지션 보유 — 스킵")
                         continue
 
                 # 전략별 리스크 체크
@@ -469,17 +479,30 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     entry_price=entry_price,
                 )
 
-                # SL/TP 계산
-                sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
-                tp_pct = cfg.get("risk", {}).get("take_profit_pct")
+                # SL/TP 계산 — v2 전략이면 동적 SL/TP 사용
+                params = cfg.get("params", {})
+                if params.get("mode") == "regressor":
+                    atr_pct = atr / entry_price if atr > 0 else 0.02
+                    sl_atr_mult = params.get("sl_atr_mult", 2.0)
+                    tp_atr_mult = params.get("tp_atr_mult", 3.0)
+                    min_sl = params.get("min_sl_pct", 0.01)
+                    max_sl_val = params.get("max_sl_pct", 0.05)
+                    min_tp = params.get("min_tp_pct", 0.01)
+                    max_tp_val = params.get("max_tp_pct", 0.08)
+                    sl_pct = max(min_sl, min(atr_pct * sl_atr_mult, max_sl_val))
+                    tp_pct = max(min_tp, min(atr_pct * tp_atr_mult, max_tp_val))
+                else:
+                    sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
+                    tp_pct = cfg.get("risk", {}).get("take_profit_pct")
+
                 sl, tp = risk_manager.get_stop_take_profit(
-                    entry_price, "long",
+                    entry_price, direction,
                     stop_loss_pct=sl_pct,
                     take_profit_pct=tp_pct,
                 )
 
                 # 가상 포지션 생성
-                virtual_tracker.open(strat_name, sym, "long", position_size, entry_price)
+                virtual_tracker.open(strat_name, sym, direction, position_size, entry_price)
 
                 # 실제 주문: 가상 합산과 실제의 차이만큼
                 current_real = positions.get(sym, {})
@@ -493,7 +516,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         order_type=cfg.get("execution", {}).get("order_type", "limit"),
                         price=entry_price,
                         strategy_name=strat_name,
-                        signal_score=1,
+                        signal_score=order.get("signal", 1),
                         stop_loss=sl,
                         take_profit=tp,
                     )
@@ -502,7 +525,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         msg = (
                             f"{log_prefix}주문 실행: {delta['side'].upper()} "
                             f"{delta['amount']:.4f} {sym} @ {entry_price:.2f} "
-                            f"({strat_name})"
+                            f"({strat_name}, {direction})"
                         )
                         logger.info(msg)
                         notifier.send_sync(msg)

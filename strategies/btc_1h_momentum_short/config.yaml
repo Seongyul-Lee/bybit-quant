@@ -1,0 +1,50 @@
+strategy:
+  name: btc_1h_momentum_short
+  type: lgbm_short_classifier
+  symbol: BTCUSDT
+  timeframe: 1h
+
+params:
+  model_path: strategies/btc_1h_momentum_short/models/latest.txt
+  feature_names_path: strategies/btc_1h_momentum_short/models/feature_names.json
+  confidence_threshold: 0.44
+  upper_barrier_multiplier: 3.0     # 숏의 SL (가격 상승 배리어)
+  lower_barrier_multiplier: 3.0     # 숏의 TP (가격 하락 배리어)
+  max_holding_period: 24
+  models_dir: strategies/btc_1h_momentum_short/models
+
+  # 숏 전용 라벨러
+  labeler_type: short_triple_barrier
+
+  ensemble_folds: [5, 13]
+
+  # 펀딩비 필터 (숏: 방향 반전)
+  # 펀딩비 z-score가 높으면(과열) → 숏 유리 → threshold 낮춤
+  # 펀딩비 z-score가 낮으면(공포) → 숏 불리 → threshold 높임/차단
+  funding_filter:
+    enabled: true
+    zscore_thresholds:
+      - {zscore_below: 0, confidence: 0.44}     # 공포(zscore<0) → 숏 불리 → 높은 threshold
+      - {zscore_below: 2, confidence: 0.42}      # 중립~과열(0<=zscore<2) → 숏 유리 → 낮은 threshold
+      # zscore >= 2 이면 극단적 과열 → 숏 매우 유리 → 차단 안 함
+      # (롱은 zscore>=2 차단, 숏은 반대)
+
+retrain:
+  enabled: true
+  interval_days: 30
+  window_type: sliding
+  window_months: 15
+  min_pf_ratio: 0.9
+  auto_ensemble: true
+  ensemble_n_folds: 2
+  use_optuna: false
+
+execution:
+  order_type: limit
+  limit_offset: 0.001
+  fee_rate: 0.00055
+
+risk:
+  max_position_pct: 0.15          # 숏은 롱(0.20)보다 보수적
+  stop_loss_pct: 0.021
+  take_profit_pct: 0.021

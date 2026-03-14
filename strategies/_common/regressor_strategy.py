@@ -54,6 +54,9 @@ class LGBMRegressorStrategy(BaseStrategy):
         self.oi_filter_enabled = oi_filter.get("enabled", False)
         self.oi_block_zscore = oi_filter.get("block_zscore", 1.0)
 
+        # 예측값 demeaning
+        self.pred_demean_window = config.get("pred_demean_window", 720)
+
         # 모델 로드
         self.ensemble_folds = config.get("ensemble_folds", None)
         self.models_dir = config.get("models_dir", "")
@@ -72,12 +75,17 @@ class LGBMRegressorStrategy(BaseStrategy):
             confidence: |예측값| 정규화 (0.0 ~ 1.0)
         """
         df_feat = self.feature_engine.compute_all_features(df)
-        last_row = df_feat[self.feature_names].iloc[[-1]]
+        X = df_feat[self.feature_names]
+        valid_mask = ~X.isna().any(axis=1)
 
-        if last_row.isna().any(axis=1).iloc[0]:
+        if not valid_mask.iloc[-1]:
             return 0, 0.0
 
-        pred = self._predict(last_row)[0]
+        # 전체 유효 구간 예측 → demeaning → 마지막 값 사용
+        X_valid = X[valid_mask]
+        all_preds = self._predict(X_valid)
+        all_preds = self._demean_predictions(all_preds)
+        pred = all_preds[-1]
 
         # 펀딩비 적응형 threshold
         threshold = self._get_adaptive_threshold(df_feat.iloc[-1], pred)
@@ -121,6 +129,9 @@ class LGBMRegressorStrategy(BaseStrategy):
 
         X_valid = X[valid_mask]
         preds = self._predict(X_valid)
+
+        # 예측값 중심화 (demeaning)
+        preds = self._demean_predictions(preds)
 
         abs_preds = np.abs(preds)
         threshold = self.min_pred_threshold
@@ -201,6 +212,34 @@ class LGBMRegressorStrategy(BaseStrategy):
         """앙상블 예측. 여러 모델의 예측값 평균."""
         preds = [m.predict(X) for m in self.models]
         return np.mean(preds, axis=0)
+
+    def _demean_predictions(self, preds: np.ndarray) -> np.ndarray:
+        """예측값 중심화: rolling mean을 빼서 양방향 시그널 가능하게 함.
+
+        oos_validation.py의 demeaning 로직과 동일:
+        - rolling(pred_demean_window, min_periods=100).mean() 사용
+        - NaN인 초기 구간은 전체 expanding mean 사용
+
+        Args:
+            preds: 원시 예측값 배열.
+
+        Returns:
+            중심화된 예측값 배열.
+        """
+        window = self.pred_demean_window
+        pred_series = pd.Series(preds)
+        rolling_mean = pred_series.rolling(
+            window=window, min_periods=100
+        ).mean()
+        centered = (pred_series - rolling_mean).values.copy()
+
+        # rolling mean이 NaN인 초기 구간은 전체 expanding mean 사용
+        nan_mask = np.isnan(centered)
+        if nan_mask.any():
+            global_mean = pred_series.iloc[:window].mean()
+            centered[nan_mask] = preds[nan_mask] - global_mean
+
+        return centered
 
     def _load_single_model(self) -> lgb.Booster:
         """단일 모델 로드."""

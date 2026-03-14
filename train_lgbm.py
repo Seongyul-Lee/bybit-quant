@@ -161,6 +161,14 @@ def main() -> None:
             oversold_mode=params_cfg.get("oversold_mode", "or"),
         )
         logger.info("MeanReversion 라벨링 시작...")
+    elif labeler_type == "short_triple_barrier":
+        from strategies._common.labeler import ShortTripleBarrierLabeler
+        labeler = ShortTripleBarrierLabeler(
+            upper_multiplier=args.upper_barrier,
+            lower_multiplier=args.lower_barrier,
+            max_holding_period=args.max_holding,
+        )
+        logger.info("Short Triple Barrier 라벨링 시작...")
     else:
         labeler = TripleBarrierLabeler(
             upper_multiplier=args.upper_barrier,

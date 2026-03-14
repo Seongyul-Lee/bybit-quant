@@ -6,6 +6,12 @@ portfolio:
     - eth_1h_momentum
     - btc_1h_mean_reversion
 
+  # v2 회귀 전략 그룹 (active_strategies에 넣으면 활성화)
+  v2_strategies:
+    - btc_1h_momentum_v2
+    - eth_1h_momentum_v2
+    - btc_1h_mean_reversion_v2
+
   allocation:
     mode: equal
     position_pct_per_strategy: 0.20
@@ -13,7 +19,7 @@ portfolio:
   limits:
     max_total_exposure: 0.60
     max_symbol_exposure: 0.30
-    max_concurrent_positions: 5
+    max_concurrent_positions: 6
 
   risk:
     max_portfolio_mdd: -0.10

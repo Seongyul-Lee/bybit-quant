@@ -196,6 +196,61 @@ class TestPortfolioManager:
 
         assert len(orders) == 0
 
+    def test_allocate_short_signal(self) -> None:
+        """숏 시그널 → sell 주문 생성."""
+        strat = MockStrategy(signal=-1, probability=0.70, symbol="BTCUSDT")
+        cfg = {"strategy": {"symbol": "BTCUSDT", "timeframe": "1h"}}
+        self.manager.register_strategy("btc_short", strat, cfg)
+
+        tracker = VirtualPositionTracker()
+        signals = {"btc_short": (-1, 0.70)}
+        orders = self.manager.allocate(signals, 100000.0, tracker)
+
+        assert len(orders) == 1
+        assert orders[0]["side"] == "sell"
+        assert orders[0]["direction"] == "short"
+        assert orders[0]["signal"] == -1
+        assert orders[0]["size_pct"] == 0.20
+
+    def test_allocate_mixed_long_short(self) -> None:
+        """롱 + 숏 혼합 시그널 → 양방향 주문 생성."""
+        strat_long = MockStrategy(signal=1, probability=0.65, symbol="BTCUSDT")
+        strat_short = MockStrategy(signal=-1, probability=0.70, symbol="ETHUSDT")
+        self.manager.register_strategy(
+            "btc_long", strat_long,
+            {"strategy": {"symbol": "BTCUSDT", "timeframe": "1h"}},
+        )
+        self.manager.register_strategy(
+            "eth_short", strat_short,
+            {"strategy": {"symbol": "ETHUSDT", "timeframe": "1h"}},
+        )
+
+        tracker = VirtualPositionTracker()
+        signals = {"btc_long": (1, 0.65), "eth_short": (-1, 0.70)}
+        orders = self.manager.allocate(signals, 100000.0, tracker)
+
+        assert len(orders) == 2
+        sides = {o["strategy"]: o["side"] for o in orders}
+        directions = {o["strategy"]: o["direction"] for o in orders}
+        assert sides["btc_long"] == "buy"
+        assert sides["eth_short"] == "sell"
+        assert directions["btc_long"] == "long"
+        assert directions["eth_short"] == "short"
+
+    def test_allocate_v1_backward_compat(self) -> None:
+        """v1 전략(signal=1만) → 기존과 동일 동작 (direction=long)."""
+        strat = MockStrategy(signal=1, probability=0.65, symbol="BTCUSDT")
+        cfg = {"strategy": {"symbol": "BTCUSDT", "timeframe": "1h"}}
+        self.manager.register_strategy("btc_v1", strat, cfg)
+
+        tracker = VirtualPositionTracker()
+        signals = {"btc_v1": (1, 0.65)}
+        orders = self.manager.allocate(signals, 100000.0, tracker)
+
+        assert len(orders) == 1
+        assert orders[0]["side"] == "buy"
+        assert orders[0]["direction"] == "long"
+
     def test_convert_symbol(self) -> None:
         """심볼 변환."""
         assert PortfolioManager._convert_symbol("BTCUSDT") == "BTC/USDT:USDT"

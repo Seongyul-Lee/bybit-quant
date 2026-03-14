@@ -139,10 +139,15 @@ class PortfolioManager:
     ) -> list[dict]:
         """시그널을 기반으로 주문 목록 생성.
 
+        양방향 시그널 처리:
+        signal == 1  → 롱 주문 (side="buy")
+        signal == -1 → 숏 주문 (side="sell")
+        signal == 0  → 무시
+
         자본 배분 규칙:
-        1. 매수 시그널 전략만 필터링
+        1. 활성 시그널(signal != 0) 전략만 필터링
         2. 각 전략에 position_pct_per_strategy × portfolio_scale × strategy_scale 적용
-        3. 이미 포지션 보유 중인 전략은 제외
+        3. 이미 같은 방향 포지션 보유 중인 전략은 제외
         4. 동일 심볼 합산 캡 적용
         5. 전체 노출 캡 적용
         6. 최소 주문 금액(100 USDT) 미달 시 제거
@@ -156,27 +161,27 @@ class PortfolioManager:
 
         Returns:
             주문 목록. 각 주문은:
-            {"strategy": name, "symbol": sym, "side": "buy",
-             "size": 0.002, "entry_price": 80000.0}
+            {"strategy": name, "symbol": sym, "side": "buy"|"sell",
+             "direction": "long"|"short", "size_pct": float, ...}
         """
         strategy_scales = strategy_scales or {}
         orders: list[dict] = []
 
-        # 1. 매수 시그널만 필터링
-        buy_signals = {
+        # 1. 활성 시그널 필터링 (롱 + 숏)
+        active_signals = {
             name: (sig, prob)
             for name, (sig, prob) in signals.items()
-            if sig == 1
+            if sig != 0
         }
 
-        if not buy_signals:
+        if not active_signals:
             return orders
 
         # 동시 포지션 수 체크
         current_position_count = len(virtual_tracker.get_all_symbols())
         remaining_slots = self.max_concurrent_positions - current_position_count
 
-        for name, (signal, prob) in buy_signals.items():
+        for name, (signal, prob) in active_signals.items():
             if remaining_slots <= 0:
                 logger.info(f"동시 포지션 한도 도달 — {name} 스킵")
                 break
@@ -196,6 +201,10 @@ class PortfolioManager:
                 logger.info(f"이미 포지션 보유: {name} | {symbol} — 스킵")
                 continue
 
+            # 방향 결정
+            side = "buy" if signal == 1 else "sell"
+            direction = "long" if signal == 1 else "short"
+
             # 스케일링 적용: position_pct × portfolio_scale × strategy_scale
             strat_scale = strategy_scales.get(name, 1.0)
             effective_pct = self.position_pct * portfolio_scale * strat_scale
@@ -212,7 +221,8 @@ class PortfolioManager:
                 {
                     "strategy": name,
                     "symbol": symbol,
-                    "side": "buy",
+                    "side": side,
+                    "direction": direction,
                     "size_pct": effective_pct,
                     "signal": signal,
                     "probability": prob,

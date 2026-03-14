@@ -114,6 +114,106 @@ class TripleBarrierLabeler:
         return _compute_atr(df, period)
 
 
+class ShortTripleBarrierLabeler:
+    """Triple Barrier 방식으로 숏 전용 2클래스 라벨을 생성.
+
+    각 봉에서 ATR 기반 상한/하한 배리어를 설정하고,
+    max_holding_period 내에 어느 배리어를 먼저 터치하는지에 따라
+    라벨을 결정한다. 하단 배리어 터치 → 1(매도 기회), 그 외 → 0(비매도).
+
+    기존 TripleBarrierLabeler와 상단/하단 판정만 반전.
+
+    Attributes:
+        upper_multiplier: 상단 배리어 ATR 배수 (숏의 SL — 가격 상승).
+        lower_multiplier: 하단 배리어 ATR 배수 (숏의 TP — 가격 하락).
+        max_holding_period: 최대 보유 기간 (봉 수).
+    """
+
+    def __init__(
+        self,
+        upper_multiplier: float = 3.0,
+        lower_multiplier: float = 3.0,
+        max_holding_period: int = 24,
+    ) -> None:
+        """ShortTripleBarrierLabeler 초기화.
+
+        Args:
+            upper_multiplier: 상단 배리어 = close + upper_multiplier * ATR_14.
+                숏에서는 SL 방향 (가격 상승 = 손실).
+            lower_multiplier: 하단 배리어 = close - lower_multiplier * ATR_14.
+                숏에서는 TP 방향 (가격 하락 = 이익).
+            max_holding_period: 배리어 미터치 시 최대 대기 봉 수.
+        """
+        self.upper_multiplier = upper_multiplier
+        self.lower_multiplier = lower_multiplier
+        self.max_holding_period = max_holding_period
+
+    def generate_labels(self, df: pd.DataFrame) -> pd.Series:
+        """숏 라벨 생성.
+
+        로직 (TripleBarrierLabeler와 비교):
+        - 기존 롱: hit_upper → 1(매수), hit_lower → 0
+        - 숏:      hit_lower → 1(매도 기회), hit_upper → 0(숏 실패)
+        - 동시 터치: 하단이 가까우면 1, 상단이 가까우면 0
+        - 타임아웃: 0 (비매도)
+
+        Args:
+            df: OHLCV 데이터프레임. atr_14 컬럼이 필요하며,
+                없으면 자체 계산한다.
+
+        Returns:
+            라벨 시리즈 (1=매도 기회, 0=비매도, NaN=라벨 불가).
+            마지막 max_holding_period 봉은 NaN.
+        """
+        close = df["close"].values
+        high = df["high"].values
+        low = df["low"].values
+
+        if "atr_14" in df.columns:
+            atr = df["atr_14"].values
+        else:
+            atr = self._compute_atr(df).values
+
+        n = len(df)
+        labels = np.full(n, np.nan)
+
+        for i in range(n - self.max_holding_period):
+            if np.isnan(atr[i]):
+                continue
+
+            upper_barrier = close[i] + self.upper_multiplier * atr[i]
+            lower_barrier = close[i] - self.lower_multiplier * atr[i]
+
+            label = 0  # 기본: 비매도 (상단 배리어 터치 또는 타임아웃)
+
+            for j in range(i + 1, i + 1 + self.max_holding_period):
+                hit_upper = high[j] >= upper_barrier
+                hit_lower = low[j] <= lower_barrier
+
+                if hit_upper and hit_lower:
+                    # 동시 터치: 하단이 가까우면 매도(숏 성공), 상단이 가까우면 비매도
+                    if abs(low[j] - close[i]) <= abs(high[j] - close[i]):
+                        label = 1
+                    else:
+                        label = 0
+                    break
+                elif hit_lower:
+                    label = 1  # 하단 터치 = 가격 하락 = 숏 성공
+                    break
+                elif hit_upper:
+                    label = 0  # 상단 터치 = 가격 상승 = 숏 실패
+                    break
+
+            labels[i] = label
+
+        return pd.Series(labels, index=df.index, name="label")
+
+    @staticmethod
+    def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """ATR 계산 (fallback)."""
+        return _compute_atr(df, period)
+
+
 class ForwardReturnLabeler:
     """미래 N봉 수익률을 연속값으로 라벨링.
 

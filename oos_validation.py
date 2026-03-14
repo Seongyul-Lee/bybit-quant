@@ -464,7 +464,10 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
             tp_pcts = pd.Series(fallback_tp, index=df.index)
 
     else:
-        # === 분류 모드 (기존 로직 — 변경 없음) ===
+        # === 분류 모드 ===
+        # 숏 전략 자동 감지: labeler_type이 short_triple_barrier이면 숏
+        is_short = params.get("labeler_type", "") == "short_triple_barrier"
+
         proba_series = pd.Series(np.nan, index=df.index)
         proba_series.loc[valid_mask] = proba
 
@@ -492,7 +495,11 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
                 adaptive_thr[block_mask] = 999.0
                 print(f"OI 필터 적용: block_zscore >= {oi_block}")
 
-        signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
+        if is_short:
+            # 숏 전략: threshold 이상이면 -1(숏)
+            signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], -1, 0)
+        else:
+            signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
 
     ts = pd.to_datetime(df["timestamp"])
 
@@ -524,8 +531,11 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
     print(f"Post-Val: {val_end_ts} ~ {oos_boundary}")
     print()
 
+    # 숏 시그널 존재 여부 확인
+    has_short = (signals == -1).any()
+
     # 시그널 분포
-    if mode == "regressor":
+    if mode == "regressor" or has_short:
         print(f"전체 시그널: 롱={int((signals==1).sum())}, 숏={int((signals==-1).sum())}, 대기={int((signals==0).sum())}")
     else:
         print(f"전체 시그널: 매수={int((signals==1).sum())}, 비매수={int((signals==0).sum())}")
@@ -545,7 +555,9 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
         print(f"시나리오: {scenario_name} - 슬리피지 편도 {slippage*100:.2f}%, 왕복 총비용 {total_cost_round:.2f}%")
         print(f"{'='*80}")
 
-        if mode == "regressor":
+        use_v2 = mode == "regressor" or has_short
+
+        if use_v2:
             print(f"{'구간':<30} {'거래':>5} {'롱':>4} {'숏':>4} {'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7}")
         else:
             print(f"{'구간':<30} {'거래':>5} {'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7}")
@@ -559,13 +571,25 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
                 print(f"{name:<30} 데이터 없음")
                 continue
 
-            if mode == "regressor":
+            if use_v2:
+                # 양방향 시뮬레이션 (regressor 또는 숏 전략)
+                if mode == "regressor":
+                    conf_slice = confidences.iloc[idx[0]:idx[-1]+1].reset_index(drop=True)
+                    sl_slice = sl_pcts.iloc[idx[0]:idx[-1]+1].reset_index(drop=True)
+                    tp_slice = tp_pcts.iloc[idx[0]:idx[-1]+1].reset_index(drop=True)
+                else:
+                    # 숏 분류 모델: confidence 고정 1.0, SL/TP 고정
+                    n_slice = idx[-1] - idx[0] + 1
+                    conf_slice = pd.Series(1.0, index=range(n_slice))
+                    sl_slice = pd.Series(SL_PCT, index=range(n_slice))
+                    tp_slice = pd.Series(TP_PCT, index=range(n_slice))
+
                 result = simulate_period_v2(
                     df.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
                     signals.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
-                    confidences.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
-                    sl_pcts.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
-                    tp_pcts.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
+                    conf_slice,
+                    sl_slice,
+                    tp_slice,
                     MAX_HOLD, POSITION_PCT, FEE_PER_SIDE,
                     slippage_per_side=slippage,
                 )
@@ -582,7 +606,7 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
                 print(f"{name:<30} 거래 없음")
                 continue
             r = result
-            if mode == "regressor":
+            if use_v2:
                 print(f"{name:<30} {r['trades']:>5} {r['long_trades']:>4} {r['short_trades']:>4} "
                       f"{r['win_rate']:>5.1f}% {r['pf']:>6.2f} "
                       f"{r['total_return']:>+7.2f}% {r['mdd']:>6.2f}%")
