@@ -17,6 +17,7 @@ import pandas as pd
 import yaml
 from dotenv import load_dotenv
 
+from src.utils.config import merge_strategy_params
 from src.utils.logger import setup_logger
 
 logger = setup_logger("main")
@@ -35,36 +36,38 @@ def load_strategy(strategy_name: str):
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    params = merge_strategy_params(config)
+
     if strategy_name == "btc_1h_momentum":
         from strategies.btc_1h_momentum.strategy import LGBMClassifierStrategy
-        return LGBMClassifierStrategy(config=config.get("params", {}))
+        return LGBMClassifierStrategy(config=params)
     elif strategy_name == "eth_1h_momentum":
         from strategies.eth_1h_momentum.strategy import LGBMClassifierStrategy as ETHStrategy
-        return ETHStrategy(config=config.get("params", {}))
+        return ETHStrategy(config=params)
     elif strategy_name == "btc_1h_mean_reversion":
         from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
-        return MeanReversionStrategy(config=config.get("params", {}))
+        return MeanReversionStrategy(config=params)
     elif strategy_name == "btc_1h_momentum_v2":
         from strategies.btc_1h_momentum_v2.strategy import BTCMomentumV2Strategy
-        return BTCMomentumV2Strategy(config=config.get("params", {}))
+        return BTCMomentumV2Strategy(config=params)
     elif strategy_name == "eth_1h_momentum_v2":
         from strategies.eth_1h_momentum_v2.strategy import ETHMomentumV2Strategy
-        return ETHMomentumV2Strategy(config=config.get("params", {}))
+        return ETHMomentumV2Strategy(config=params)
     elif strategy_name == "btc_1h_mean_reversion_v2":
         from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
-        return BTCMeanReversionV2Strategy(config=config.get("params", {}))
+        return BTCMeanReversionV2Strategy(config=params)
     elif strategy_name == "btc_1h_momentum_short":
         from strategies.btc_1h_momentum_short.strategy import BTCMomentumShortStrategy
-        return BTCMomentumShortStrategy(config=config.get("params", {}))
+        return BTCMomentumShortStrategy(config=params)
     elif strategy_name == "eth_1h_momentum_short":
         from strategies.eth_1h_momentum_short.strategy import ETHMomentumShortStrategy
-        return ETHMomentumShortStrategy(config=config.get("params", {}))
+        return ETHMomentumShortStrategy(config=params)
     elif strategy_name == "btc_1h_mean_reversion_short":
         from strategies.btc_1h_mean_reversion_short.strategy import BTCMeanReversionShortStrategy
-        return BTCMeanReversionShortStrategy(config=config.get("params", {}))
+        return BTCMeanReversionShortStrategy(config=params)
     elif strategy_name == "funding_arb":
         from strategies.funding_arb.strategy import FundingArbStrategy
-        return FundingArbStrategy(config=config.get("params", {}))
+        return FundingArbStrategy(config=params)
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 

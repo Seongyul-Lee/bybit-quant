@@ -13,6 +13,7 @@ import pandas as pd
 import yaml
 from dotenv import load_dotenv
 
+from src.utils.config import merge_strategy_params
 from src.utils.logger import setup_logger
 from src.utils.notify import TelegramNotifier
 
@@ -43,24 +44,26 @@ def run(
     timeframe = timeframe or config["strategy"]["timeframe"]
 
     # 전략 인스턴스 생성
+    params = merge_strategy_params(config)
+
     if strategy_name == "btc_1h_momentum":
         from strategies.btc_1h_momentum.strategy import LGBMClassifierStrategy
-        strategy = LGBMClassifierStrategy(config=config.get("params", {}))
+        strategy = LGBMClassifierStrategy(config=params)
     elif strategy_name == "eth_1h_momentum":
         from strategies.eth_1h_momentum.strategy import LGBMClassifierStrategy as ETHStrategy
-        strategy = ETHStrategy(config=config.get("params", {}))
+        strategy = ETHStrategy(config=params)
     elif strategy_name == "btc_1h_mean_reversion":
         from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
-        strategy = MeanReversionStrategy(config=config.get("params", {}))
+        strategy = MeanReversionStrategy(config=params)
     elif strategy_name == "btc_1h_momentum_v2":
         from strategies.btc_1h_momentum_v2.strategy import BTCMomentumV2Strategy
-        strategy = BTCMomentumV2Strategy(config=config.get("params", {}))
+        strategy = BTCMomentumV2Strategy(config=params)
     elif strategy_name == "eth_1h_momentum_v2":
         from strategies.eth_1h_momentum_v2.strategy import ETHMomentumV2Strategy
-        strategy = ETHMomentumV2Strategy(config=config.get("params", {}))
+        strategy = ETHMomentumV2Strategy(config=params)
     elif strategy_name == "btc_1h_mean_reversion_v2":
         from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
-        strategy = BTCMeanReversionV2Strategy(config=config.get("params", {}))
+        strategy = BTCMeanReversionV2Strategy(config=params)
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 

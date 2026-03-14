@@ -12,6 +12,7 @@ import yaml
 
 from src.strategies.base import BaseStrategy
 from src.portfolio.virtual_position import VirtualPositionTracker
+from src.utils.config import merge_strategy_params
 from src.utils.logger import setup_logger
 
 logger = setup_logger("portfolio_manager")
@@ -373,7 +374,7 @@ class PortfolioManager:
                     f"strategies/{strategy_name}/strategy.py"
                 )
 
-            strategy = strategy_class(config=config.get("params", {}))
+            strategy = strategy_class(config=merge_strategy_params(config))
             self.register_strategy(strategy_name, strategy, config)
 
         logger.info(

@@ -21,6 +21,7 @@ import yaml
 from dotenv import load_dotenv
 
 from oos_validation import simulate_period_v2
+from src.utils.config import merge_strategy_params
 from src.utils.logger import setup_logger
 
 logger = setup_logger("portfolio_backtest")
@@ -68,7 +69,7 @@ def load_strategy_instance(strategy_name: str):
     if strategy_class is None:
         raise ValueError(f"BaseStrategy 서브클래스를 찾을 수 없음: {strategy_name}")
 
-    strategy = strategy_class(config=config.get("params", {}))
+    strategy = strategy_class(config=merge_strategy_params(config))
     return strategy, config
 
 
