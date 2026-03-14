@@ -475,6 +475,13 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     log_prefix = "[TESTNET] " if testnet else ""
     state_path = STATE_PATH_TESTNET if testnet else STATE_PATH_MAINNET
 
+    # === v1 전략이 사용하는 perp 심볼 (ARB 충돌 방지용) ===
+    v1_perp_symbols: set[str] = set()
+    for name in portfolio_manager.get_active_strategies():
+        cfg = portfolio_manager.get_strategy_config(name)
+        sym_raw = cfg.get("strategy", {}).get("symbol", "BTCUSDT")
+        v1_perp_symbols.add(_convert_symbol(sym_raw))
+
     # === 펀딩비 차익거래 초기화 ===
     arb_executor = None
     arb_config = None
@@ -483,6 +490,23 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     last_funding_check = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
     arb_config = _load_funding_arb_config(portfolio_config)
+    if arb_config:
+        arb_symbols = arb_config.get("strategy", {}).get("symbols", [])
+        blocked = [s["perp"] for s in arb_symbols if s["perp"] in v1_perp_symbols]
+        filtered = [s for s in arb_symbols if s["perp"] not in v1_perp_symbols]
+
+        if blocked:
+            logger.warning(
+                f"funding_arb 심볼 충돌 차단: {blocked} "
+                f"(v1 전략과 동일 perp 심볼 — NET 포지션 모드 충돌 방지)"
+            )
+            if not filtered:
+                logger.warning(
+                    "funding_arb 전체 심볼이 v1 전략과 충돌 — "
+                    "차익거래 비활성화 (별도 서브계정 사용 권장)"
+                )
+        arb_config["strategy"]["symbols"] = filtered
+
     if arb_config and arb_config.get("strategy", {}).get("symbols"):
         try:
             from src.execution.spot_executor import SpotExecutor

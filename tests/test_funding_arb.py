@@ -144,6 +144,51 @@ class TestConfigLoading:
         assert result is None
 
 
+class TestArbSymbolGuard:
+    """ARB ↔ v1 전략 동일 심볼 충돌 방지 가드 테스트."""
+
+    @staticmethod
+    def _filter_arb_symbols(arb_symbols: list[dict], v1_perp_symbols: set[str]):
+        """main.py의 가드 로직을 재현."""
+        blocked = [s["perp"] for s in arb_symbols if s["perp"] in v1_perp_symbols]
+        filtered = [s for s in arb_symbols if s["perp"] not in v1_perp_symbols]
+        return blocked, filtered
+
+    def test_arb_symbol_guard_full_overlap(self):
+        """v1=BTC+ETH, ARB=BTC+ETH → ARB 전체 차단."""
+        v1_perp = {"BTC/USDT:USDT", "ETH/USDT:USDT"}
+        arb_syms = [
+            {"spot": "BTC/USDT", "perp": "BTC/USDT:USDT"},
+            {"spot": "ETH/USDT", "perp": "ETH/USDT:USDT"},
+        ]
+        blocked, filtered = self._filter_arb_symbols(arb_syms, v1_perp)
+        assert len(blocked) == 2
+        assert len(filtered) == 0
+
+    def test_arb_symbol_guard_partial_overlap(self):
+        """v1=BTC만, ARB=BTC+ETH → ETH만 남음."""
+        v1_perp = {"BTC/USDT:USDT"}
+        arb_syms = [
+            {"spot": "BTC/USDT", "perp": "BTC/USDT:USDT"},
+            {"spot": "ETH/USDT", "perp": "ETH/USDT:USDT"},
+        ]
+        blocked, filtered = self._filter_arb_symbols(arb_syms, v1_perp)
+        assert blocked == ["BTC/USDT:USDT"]
+        assert len(filtered) == 1
+        assert filtered[0]["perp"] == "ETH/USDT:USDT"
+
+    def test_arb_symbol_guard_no_overlap(self):
+        """v1=SOL, ARB=BTC+ETH → 전체 허용."""
+        v1_perp = {"SOL/USDT:USDT"}
+        arb_syms = [
+            {"spot": "BTC/USDT", "perp": "BTC/USDT:USDT"},
+            {"spot": "ETH/USDT", "perp": "ETH/USDT:USDT"},
+        ]
+        blocked, filtered = self._filter_arb_symbols(arb_syms, v1_perp)
+        assert len(blocked) == 0
+        assert len(filtered) == 2
+
+
 # --- Testnet Integration Tests ---
 
 @pytest.mark.skipif(not _has_testnet_keys(), reason="Testnet API keys not configured")
