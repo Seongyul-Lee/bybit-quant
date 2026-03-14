@@ -1,0 +1,17 @@
+{
+  "boosting_type": "gbdt",
+  "objective": "multiclass",
+  "num_class": 3,
+  "metric": "multi_logloss",
+  "n_estimators": 1000,
+  "bagging_freq": 5,
+  "class_weight": "balanced",
+  "verbose": -1,
+  "num_leaves": 17,
+  "min_child_samples": 192,
+  "learning_rate": 0.01599914760144554,
+  "reg_alpha": 0.19975409053043558,
+  "reg_lambda": 0.21964114643931812,
+  "feature_fraction": 0.6323750022068905,
+  "bagging_fraction": 0.5903689896067716
+}
