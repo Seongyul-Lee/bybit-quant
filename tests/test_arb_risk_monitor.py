@@ -55,14 +55,14 @@ class TestCheckBasis:
         monitor = ArbRiskMonitor({})
         for i in range(5):
             monitor.check_basis(100_000, 100_000 + i * 100)
-        assert len(monitor._basis_history) == 5
+        assert len(monitor._basis_history["BTC"]) == 5
 
     def test_basis_history_capped_at_100(self):
         """베이시스 이력이 100개로 제한."""
         monitor = ArbRiskMonitor({})
         for i in range(120):
             monitor.check_basis(100_000, 100_000 + i)
-        assert len(monitor._basis_history) == 100
+        assert len(monitor._basis_history["BTC"]) == 100
 
 
 class TestCheckMargin:
@@ -171,7 +171,7 @@ class TestCheckFundingTrend:
         monitor.check_funding_trend(0.01)
         monitor.check_funding_trend(-0.005)
         monitor.check_funding_trend(0.003)
-        assert abs(monitor._cumulative_funding - 0.008) < 1e-10
+        assert abs(monitor._cumulative_funding["BTC"] - 0.008) < 1e-10
 
 
 class TestCheckEntrySlippage:
@@ -269,23 +269,28 @@ class TestSerialization:
         monitor.check_basis(100_000, 100_100)
 
         state = monitor.to_dict()
-        assert state["consecutive_negative"] == 2
-        assert abs(state["cumulative_funding"] - (-0.003)) < 1e-10
-        assert len(state["basis_history_last10"]) == 1
+        btc = state["per_coin"]["BTC"]
+        assert btc["consecutive_negative"] == 2
+        assert abs(btc["cumulative_funding"] - (-0.003)) < 1e-10
+        assert len(btc["basis_history_last10"]) == 1
 
     def test_from_dict_restores_state(self):
         """from_dict로 상태 복원."""
         monitor = ArbRiskMonitor({})
         state = {
-            "consecutive_negative": 4,
-            "cumulative_funding": -0.01,
-            "basis_history_last10": [0.001, -0.002],
+            "per_coin": {
+                "BTC": {
+                    "consecutive_negative": 4,
+                    "cumulative_funding": -0.01,
+                    "basis_history_last10": [0.001, -0.002],
+                }
+            }
         }
         monitor.from_dict(state)
 
-        assert monitor._consecutive_negative == 4
-        assert monitor._cumulative_funding == -0.01
-        assert len(monitor._basis_history) == 2
+        assert monitor._consecutive_negative["BTC"] == 4
+        assert monitor._cumulative_funding["BTC"] == -0.01
+        assert len(monitor._basis_history["BTC"]) == 2
 
     def test_roundtrip(self):
         """직렬화 → 복원 라운드트립."""
@@ -299,9 +304,104 @@ class TestSerialization:
         m2 = ArbRiskMonitor({})
         m2.from_dict(state)
 
-        assert m2._consecutive_negative == m1._consecutive_negative
-        assert m2._cumulative_funding == m1._cumulative_funding
-        assert m2._basis_history == m1._basis_history
+        assert m2._consecutive_negative["BTC"] == m1._consecutive_negative["BTC"]
+        assert m2._cumulative_funding["BTC"] == m1._cumulative_funding["BTC"]
+        assert m2._basis_history["BTC"] == m1._basis_history["BTC"]
+
+
+class TestPerCoinState:
+    """코인별 상태 독립성 테스트."""
+
+    def test_basis_per_coin_isolated(self):
+        """BTC/ETH 베이시스가 독립."""
+        monitor = ArbRiskMonitor({})
+        monitor.check_basis(100_000, 100_100, coin="BTC")
+        monitor.check_basis(3_000, 3_010, coin="ETH")
+        monitor.check_basis(100_000, 100_200, coin="BTC")
+
+        assert len(monitor._basis_history["BTC"]) == 2
+        assert len(monitor._basis_history["ETH"]) == 1
+
+    def test_funding_trend_per_coin_isolated(self):
+        """BTC 연속음수가 ETH 양수로 리셋 안 됨."""
+        monitor = ArbRiskMonitor({"max_consecutive_negative": 6})
+        for _ in range(4):
+            monitor.check_funding_trend(-0.001, coin="BTC")
+        monitor.check_funding_trend(0.01, coin="ETH")
+
+        assert monitor._consecutive_negative["BTC"] == 4
+        assert monitor._consecutive_negative["ETH"] == 0
+
+    def test_cumulative_per_coin(self):
+        """코인별 누적 펀딩비 독립."""
+        monitor = ArbRiskMonitor({})
+        monitor.check_funding_trend(0.01, coin="BTC")
+        monitor.check_funding_trend(-0.005, coin="ETH")
+
+        assert abs(monitor._cumulative_funding["BTC"] - 0.01) < 1e-10
+        assert abs(monitor._cumulative_funding["ETH"] - (-0.005)) < 1e-10
+
+    def test_serialization_multi_coin(self):
+        """멀티코인 직렬화/복원."""
+        m1 = ArbRiskMonitor({})
+        m1.check_funding_trend(-0.001, coin="BTC")
+        m1.check_funding_trend(0.002, coin="ETH")
+        m1.check_basis(100_000, 100_100, coin="BTC")
+        m1.check_basis(3_000, 3_010, coin="ETH")
+
+        state = m1.to_dict()
+        assert "BTC" in state["per_coin"]
+        assert "ETH" in state["per_coin"]
+
+        m2 = ArbRiskMonitor({})
+        m2.from_dict(state)
+
+        assert m2._consecutive_negative["BTC"] == 1
+        assert m2._consecutive_negative["ETH"] == 0
+        assert abs(m2._cumulative_funding["ETH"] - 0.002) < 1e-10
+
+
+class TestLegacyDeserialization:
+    """레거시 상태 복원 테스트."""
+
+    def test_legacy_format_loads_as_btc(self):
+        """이전 형식(per_coin 키 없음)이 BTC로 복원."""
+        monitor = ArbRiskMonitor({})
+        legacy_state = {
+            "consecutive_negative": 3,
+            "cumulative_funding": -0.005,
+            "basis_history_last10": [0.001, 0.002],
+        }
+        monitor.from_dict(legacy_state)
+
+        assert monitor._consecutive_negative["BTC"] == 3
+        assert monitor._cumulative_funding["BTC"] == -0.005
+        assert len(monitor._basis_history["BTC"]) == 2
+
+
+class TestCumulativeLossCheck:
+    """누적 손실 체크 테스트."""
+
+    def test_cumulative_loss_critical(self):
+        """누적 손실 초과 시 critical."""
+        monitor = ArbRiskMonitor({"max_cumulative_loss_pct": 0.03, "max_consecutive_negative": 100})
+        # 양수 펀딩비 사이에 큰 음수 → 연속 음수는 아니지만 누적은 음수
+        monitor.check_funding_trend(-0.02)
+        monitor.check_funding_trend(0.005)
+        result = monitor.check_funding_trend(-0.02)
+
+        assert result["level"] == "critical"
+        assert "누적 펀딩비 손실 긴급" in result["message"]
+        assert abs(result["cumulative_funding"] - (-0.035)) < 1e-10
+
+    def test_cumulative_loss_normal(self):
+        """누적 손실 미만 시 normal."""
+        monitor = ArbRiskMonitor({"max_cumulative_loss_pct": 0.03})
+        monitor.check_funding_trend(-0.01)
+        result = monitor.check_funding_trend(0.005)
+
+        assert result["level"] == "normal"
+        assert abs(result["cumulative_funding"] - (-0.005)) < 1e-10
 
 
 class TestExtractFillPrice:

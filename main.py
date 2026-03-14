@@ -262,7 +262,7 @@ def _run_funding_arb_check(
                 logger.warning("포트폴리오 가치 0 — 차익거래 진입 불가")
                 continue
 
-            capital_for_arb = portfolio_value * capital_pct
+            capital_for_arb = portfolio_value * capital_pct / len(symbols)
             spot_price = arb_executor.spot.get_spot_price(symbol_spot)
             if spot_price <= 0:
                 logger.warning(f"현물 가격 조회 실패 — {coin} 차익거래 진입 스킵")
@@ -292,6 +292,14 @@ def _run_funding_arb_check(
                     "entry_price": spot_price,
                     "total_funding_collected": 0.0,
                 }
+
+                # 진입 슬리피지 리스크 체크
+                if arb_risk_monitor and result.get("spot_fill_price") and result.get("perp_fill_price"):
+                    slip = arb_risk_monitor.check_entry_slippage(
+                        result["spot_fill_price"], result["perp_fill_price"]
+                    )
+                    if slip["level"] == "warn":
+                        notifier.send_sync(f"{log_prefix}[펀딩비 차익] ⚠️ {slip['message']}")
             else:
                 msg = f"{log_prefix}[펀딩비 차익] {coin} 진입 실패"
                 notifier.send_sync(msg)
@@ -327,9 +335,9 @@ def _run_funding_arb_check(
                     perp_price = float(perp_ticker["last"]) if perp_ticker else 0
 
                     if spot_price > 0 and perp_price > 0:
-                        basis_result = arb_risk_monitor.check_basis(spot_price, perp_price)
+                        basis_result = arb_risk_monitor.check_basis(spot_price, perp_price, coin=coin)
                         if basis_result["level"] == "critical":
-                            if arb_risk_monitor.should_send_alert("basis", "critical"):
+                            if arb_risk_monitor.should_send_alert(f"basis_{coin}", "critical"):
                                 notifier.send_sync(
                                     f"{log_prefix}[펀딩비 차익] ⚠️ {basis_result['message']}"
                                 )
@@ -340,12 +348,12 @@ def _run_funding_arb_check(
                         arb_executor.perp.exchange, symbol_perp
                     )
                     if margin_result["level"] == "critical":
-                        if arb_risk_monitor.should_send_alert("margin", "critical"):
+                        if arb_risk_monitor.should_send_alert(f"margin_{coin}", "critical"):
                             notifier.send_sync(
                                 f"{log_prefix}[펀딩비 차익] 🚨 {margin_result['message']}"
                             )
                     elif margin_result["level"] == "warn":
-                        if arb_risk_monitor.should_send_alert("margin", "warn"):
+                        if arb_risk_monitor.should_send_alert(f"margin_{coin}", "warn"):
                             notifier.send_sync(
                                 f"{log_prefix}[펀딩비 차익] ⚠️ {margin_result['message']}"
                             )
@@ -412,13 +420,13 @@ def _check_funding_settlement(
 
             # 펀딩비 추세 체크
             if arb_risk_monitor:
-                trend = arb_risk_monitor.check_funding_trend(income)
+                trend = arb_risk_monitor.check_funding_trend(income, coin=coin)
                 if trend["level"] == "critical":
                     notifier.send_sync(
                         f"{log_prefix}[펀딩비 차익] 🚨 {trend['message']} — 수동 청산 검토"
                     )
                 elif trend["level"] == "warn":
-                    if arb_risk_monitor.should_send_alert("funding_trend", "warn"):
+                    if arb_risk_monitor.should_send_alert(f"funding_trend_{coin}", "warn"):
                         notifier.send_sync(
                             f"{log_prefix}[펀딩비 차익] ⚠️ {trend['message']}"
                         )
@@ -690,10 +698,20 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         if closed_pnl != 0:
                             risk_manager.circuit_breaker.record_trade(closed_pnl)
                             pnl_tracker.record_pnl(closed_pnl)
-                            # PnL을 가상 포지션 보유 전략에 분배 (FIFO: 첫 전략에 할당)
+                            # PnL을 가상 포지션 보유 전략에 비례 분배
                             if strategies_with_pos:
-                                pnl_strategy = strategies_with_pos[0]
-                                portfolio_risk.record_trade(pnl_strategy, closed_pnl)
+                                total_virt_size = sum(
+                                    virtual_tracker.get_position(s, sym).get("size", 0)
+                                    for s in strategies_with_pos
+                                )
+                                for s in strategies_with_pos:
+                                    virt_size = virtual_tracker.get_position(s, sym).get("size", 0)
+                                    ratio = (
+                                        virt_size / total_virt_size
+                                        if total_virt_size > 0
+                                        else 1.0 / len(strategies_with_pos)
+                                    )
+                                    portfolio_risk.record_trade(s, closed_pnl * ratio)
                             executor.record_closed_pnl(
                                 symbol=sym,
                                 pnl=closed_pnl,
@@ -780,7 +798,10 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 strategy_scales=strategy_scales,
             )
 
-            # 16. 각 주문 실행
+            # 16. 주문 실행 (2-Pass: 가상 포지션 일괄 등록 → 심볼별 단일 delta order)
+
+            # Pass 1: 리스크 체크 + 가상 포지션 일괄 등록
+            executed_symbols: dict[str, dict] = {}  # sym → 마지막 주문 정보
             for order in orders:
                 strat_name = order["strategy"]
                 sym = order["symbol"]
@@ -793,12 +814,14 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     continue
                 entry_price = float(df["close"].iloc[-1])
 
-                # 기존 포지션 체크: 같은 방향이면 스킵
+                # 반대 방향 포지션 충돌 체크 (같은 방향은 가상 포지션 합산으로 처리)
                 existing_pos = positions.get(sym)
-                if existing_pos:
-                    if existing_pos["side"] == direction:
-                        logger.info(f"이미 {sym} {direction} 포지션 보유 — 스킵")
-                        continue
+                if existing_pos and existing_pos["side"] != direction:
+                    logger.warning(
+                        f"{sym} 반대 방향 포지션 충돌: "
+                        f"기존={existing_pos['side']}, 신규={direction} — 스킵"
+                    )
+                    continue
 
                 # 전략별 리스크 체크
                 atr_value = _compute_atr(df)
@@ -827,10 +850,12 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     logger.warning(f"ATR 계산 불가 ({strat_name}) — 주문 스킵")
                     continue
 
+                size_pct = order.get("size_pct")
                 position_size = risk_manager.calculate_atr_position_size(
                     portfolio_value=portfolio_value,
                     atr=atr,
                     entry_price=entry_price,
+                    max_position_pct=size_pct,
                 )
 
                 # SL/TP 계산 — v2 전략이면 동적 SL/TP 사용
@@ -855,22 +880,78 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     take_profit_pct=tp_pct,
                 )
 
-                # 가상 포지션 생성
+                # 가상 포지션 생성 (실제 주문은 아직)
                 virtual_tracker.open(strat_name, sym, direction, position_size, entry_price)
 
-                # 실제 주문: 가상 합산과 실제의 차이만큼
+                # 심볼별 마지막 주문 정보 기록 (Pass 2에서 사용)
+                executed_symbols[sym] = {
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "sl": sl,
+                    "tp": tp,
+                    "strat_name": strat_name,
+                    "order_type": cfg.get("execution", {}).get("order_type", "limit"),
+                    "signal": order.get("signal", 1),
+                }
+
+            # Pass 2: 심볼별 단일 delta order 실행
+            for sym, info in executed_symbols.items():
                 current_real = positions.get(sym, {})
                 deltas = virtual_tracker.get_delta_orders(sym, current_real)
+
+                # SL/TP: 동일 심볼 전략들의 가중 평균
+                strategies_on_sym = virtual_tracker.get_strategies_for_symbol(sym)
+                if len(strategies_on_sym) > 1:
+                    total_size = 0.0
+                    weighted_sl_pct = 0.0
+                    weighted_tp_pct = 0.0
+                    for s in strategies_on_sym:
+                        vpos = virtual_tracker.get_position(s, sym)
+                        s_cfg = portfolio_manager.get_strategy_config(s)
+                        s_params = s_cfg.get("params", {})
+                        if s_params.get("mode") == "regressor":
+                            s_df = data_dict.get(s)
+                            s_atr = _compute_atr(s_df) if s_df is not None else 0.0
+                            s_atr_pct = s_atr / info["entry_price"] if s_atr > 0 else 0.02
+                            s_sl_pct = max(
+                                s_params.get("min_sl_pct", 0.01),
+                                min(s_atr_pct * s_params.get("sl_atr_mult", 2.0),
+                                    s_params.get("max_sl_pct", 0.05)),
+                            )
+                            s_tp_pct = max(
+                                s_params.get("min_tp_pct", 0.01),
+                                min(s_atr_pct * s_params.get("tp_atr_mult", 3.0),
+                                    s_params.get("max_tp_pct", 0.08)),
+                            )
+                        else:
+                            s_sl_pct = s_cfg.get("risk", {}).get("stop_loss_pct", 0.021)
+                            s_tp_pct = s_cfg.get("risk", {}).get("take_profit_pct", 0.021)
+                        s_size = vpos.get("size", 0)
+                        total_size += s_size
+                        weighted_sl_pct += s_sl_pct * s_size
+                        weighted_tp_pct += s_tp_pct * s_size
+                    if total_size > 0:
+                        avg_sl_pct = weighted_sl_pct / total_size
+                        avg_tp_pct = weighted_tp_pct / total_size
+                        sl, tp = risk_manager.get_stop_take_profit(
+                            info["entry_price"], info["direction"],
+                            stop_loss_pct=avg_sl_pct,
+                            take_profit_pct=avg_tp_pct,
+                        )
+                    else:
+                        sl, tp = info["sl"], info["tp"]
+                else:
+                    sl, tp = info["sl"], info["tp"]
 
                 for delta in deltas:
                     exec_order = executor.execute(
                         symbol=delta["symbol"],
                         side=delta["side"],
                         amount=delta["amount"],
-                        order_type=cfg.get("execution", {}).get("order_type", "limit"),
-                        price=entry_price,
-                        strategy_name=strat_name,
-                        signal_score=order.get("signal", 1),
+                        order_type=info["order_type"],
+                        price=info["entry_price"],
+                        strategy_name=info["strat_name"],
+                        signal_score=info["signal"],
                         stop_loss=sl,
                         take_profit=tp,
                     )
@@ -878,8 +959,8 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     if exec_order:
                         msg = (
                             f"{log_prefix}주문 실행: {delta['side'].upper()} "
-                            f"{delta['amount']:.4f} {sym} @ {entry_price:.2f} "
-                            f"({strat_name}, {direction})"
+                            f"{delta['amount']:.4f} {sym} @ {info['entry_price']:.2f} "
+                            f"({', '.join(strategies_on_sym)}, {info['direction']})"
                         )
                         logger.info(msg)
                         notifier.send_sync(msg)

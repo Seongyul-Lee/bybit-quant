@@ -45,14 +45,23 @@ class ArbRiskMonitor:
         # 누적 손실
         self.max_cumulative_loss_pct = config.get("max_cumulative_loss_pct", 0.03)
 
-        # 내부 상태
-        self._consecutive_negative: int = 0
-        self._cumulative_funding: float = 0.0
-        self._basis_history: list[float] = []
+        # 내부 상태 (코인별)
+        self._consecutive_negative: dict[str, int] = {}
+        self._cumulative_funding: dict[str, float] = {}
+        self._basis_history: dict[str, list[float]] = {}
 
         # 알림 빈도 제한: {alert_type: last_sent_timestamp}
         self._last_alert_time: dict[str, float] = {}
         self._alert_cooldown_sec: float = 3600.0  # 1시간
+
+    def _ensure_coin(self, coin: str) -> None:
+        """코인 상태가 없으면 초기화."""
+        if coin not in self._consecutive_negative:
+            self._consecutive_negative[coin] = 0
+        if coin not in self._cumulative_funding:
+            self._cumulative_funding[coin] = 0.0
+        if coin not in self._basis_history:
+            self._basis_history[coin] = []
 
     def should_send_alert(self, alert_type: str, level: str) -> bool:
         """알림 빈도 제한 체크.
@@ -77,24 +86,27 @@ class ArbRiskMonitor:
         return False
 
     def check_basis(
-        self, spot_price: float, perp_price: float
+        self, spot_price: float, perp_price: float, *, coin: str = "BTC"
     ) -> dict[str, Any]:
         """베이시스 리스크 체크.
 
         Args:
             spot_price: 현물 가격.
             perp_price: 선물 가격.
+            coin: 코인 식별자 (기본 "BTC").
 
         Returns:
             {"basis_pct": float, "level": str, "message": str | None}
         """
+        self._ensure_coin(coin)
+
         if spot_price <= 0:
             return {"basis_pct": 0, "level": "normal", "message": None}
 
         basis_pct = (perp_price - spot_price) / spot_price
-        self._basis_history.append(basis_pct)
-        if len(self._basis_history) > 100:
-            self._basis_history = self._basis_history[-100:]
+        self._basis_history[coin].append(basis_pct)
+        if len(self._basis_history[coin]) > 100:
+            self._basis_history[coin] = self._basis_history[coin][-100:]
 
         if abs(basis_pct) > self.basis_critical_pct:
             return {
@@ -167,40 +179,63 @@ class ArbRiskMonitor:
                 "message": f"마진 조회 실패: {e}",
             }
 
-    def check_funding_trend(self, funding_rate: float) -> dict[str, Any]:
+    def check_funding_trend(
+        self, funding_rate: float, *, coin: str = "BTC"
+    ) -> dict[str, Any]:
         """펀딩비 추세 체크.
 
         연속 음수 펀딩비 횟수를 추적.
 
         Args:
             funding_rate: 최근 결제된 펀딩비.
+            coin: 코인 식별자 (기본 "BTC").
 
         Returns:
-            {"consecutive_negative": int, "level": str, "message": str | None}
+            {"consecutive_negative": int, "cumulative_funding": float,
+             "level": str, "message": str | None}
         """
-        if funding_rate < 0:
-            self._consecutive_negative += 1
-        else:
-            self._consecutive_negative = 0
-        self._cumulative_funding += funding_rate
+        self._ensure_coin(coin)
 
-        if self._consecutive_negative >= self.max_consecutive_negative:
+        if funding_rate < 0:
+            self._consecutive_negative[coin] += 1
+        else:
+            self._consecutive_negative[coin] = 0
+        self._cumulative_funding[coin] += funding_rate
+
+        if self._consecutive_negative[coin] >= self.max_consecutive_negative:
             return {
-                "consecutive_negative": self._consecutive_negative,
+                "consecutive_negative": self._consecutive_negative[coin],
+                "cumulative_funding": self._cumulative_funding[coin],
                 "level": "critical",
                 "message": (
-                    f"연속 음수 펀딩비 {self._consecutive_negative}회 "
-                    f"({self._consecutive_negative * 8}시간)"
+                    f"연속 음수 펀딩비 {self._consecutive_negative[coin]}회 "
+                    f"({self._consecutive_negative[coin] * 8}시간)"
                 ),
             }
-        elif self._consecutive_negative >= self.max_consecutive_negative // 2:
+
+        # 누적 손실 체크
+        cumulative = self._cumulative_funding[coin]
+        if cumulative < -self.max_cumulative_loss_pct:
             return {
-                "consecutive_negative": self._consecutive_negative,
+                "consecutive_negative": self._consecutive_negative[coin],
+                "cumulative_funding": cumulative,
+                "level": "critical",
+                "message": (
+                    f"누적 펀딩비 손실 긴급: {cumulative:+.4f} "
+                    f"(임계 -{self.max_cumulative_loss_pct:.2%})"
+                ),
+            }
+
+        if self._consecutive_negative[coin] >= self.max_consecutive_negative // 2:
+            return {
+                "consecutive_negative": self._consecutive_negative[coin],
+                "cumulative_funding": self._cumulative_funding[coin],
                 "level": "warn",
-                "message": f"연속 음수 펀딩비 {self._consecutive_negative}회",
+                "message": f"연속 음수 펀딩비 {self._consecutive_negative[coin]}회",
             }
         return {
-            "consecutive_negative": self._consecutive_negative,
+            "consecutive_negative": self._consecutive_negative[coin],
+            "cumulative_funding": self._cumulative_funding[coin],
             "level": "normal",
             "message": None,
         }
@@ -243,6 +278,8 @@ class ArbRiskMonitor:
         perp_price: float,
         exchange: Any,
         symbol_perp: str,
+        *,
+        coin: str = "BTC",
     ) -> list[dict[str, Any]]:
         """전체 리스크 체크.
 
@@ -251,13 +288,14 @@ class ArbRiskMonitor:
             perp_price: 선물 가격.
             exchange: ccxt.bybit 인스턴스.
             symbol_perp: 선물 심볼.
+            coin: 코인 식별자 (기본 "BTC").
 
         Returns:
             경고/긴급 메시지 리스트 (level이 normal이 아닌 것만).
         """
         alerts: list[dict[str, Any]] = []
 
-        basis = self.check_basis(spot_price, perp_price)
+        basis = self.check_basis(spot_price, perp_price, coin=coin)
         if basis["level"] != "normal":
             alerts.append(basis)
 
@@ -268,15 +306,30 @@ class ArbRiskMonitor:
         return alerts
 
     def to_dict(self) -> dict:
-        """상태 직렬화."""
-        return {
-            "consecutive_negative": self._consecutive_negative,
-            "cumulative_funding": self._cumulative_funding,
-            "basis_history_last10": self._basis_history[-10:],
-        }
+        """상태 직렬화 (코인별)."""
+        per_coin: dict[str, dict] = {}
+        all_coins = set(
+            list(self._consecutive_negative)
+            + list(self._cumulative_funding)
+            + list(self._basis_history)
+        )
+        for coin in all_coins:
+            per_coin[coin] = {
+                "consecutive_negative": self._consecutive_negative.get(coin, 0),
+                "cumulative_funding": self._cumulative_funding.get(coin, 0.0),
+                "basis_history_last10": self._basis_history.get(coin, [])[-10:],
+            }
+        return {"per_coin": per_coin}
 
     def from_dict(self, data: dict) -> None:
-        """상태 복원."""
-        self._consecutive_negative = data.get("consecutive_negative", 0)
-        self._cumulative_funding = data.get("cumulative_funding", 0.0)
-        self._basis_history = data.get("basis_history_last10", [])
+        """상태 복원 (레거시 호환)."""
+        if "per_coin" in data:
+            for coin, d in data["per_coin"].items():
+                self._consecutive_negative[coin] = d.get("consecutive_negative", 0)
+                self._cumulative_funding[coin] = d.get("cumulative_funding", 0.0)
+                self._basis_history[coin] = d.get("basis_history_last10", [])
+        else:
+            # 레거시: per_coin 키 없는 기존 상태 → "BTC"로 복원
+            self._consecutive_negative["BTC"] = data.get("consecutive_negative", 0)
+            self._cumulative_funding["BTC"] = data.get("cumulative_funding", 0.0)
+            self._basis_history["BTC"] = data.get("basis_history_last10", [])
