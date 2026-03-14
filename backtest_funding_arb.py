@@ -1,17 +1,22 @@
 """펀딩비 차익거래 백테스트.
 
 현물 매수 + 선물 숏의 델타 중립 포지션에서 펀딩비를 수취하는
-정적 전략을 시뮬레이션한다.
+정적/ML 전략을 시뮬레이션한다.
 
 사용법:
-    python backtest_funding_arb.py
+    python backtest_funding_arb.py                         # Phase 1 정적 전략
+    python backtest_funding_arb.py --phase2                # Phase 2 ML 강화
     python backtest_funding_arb.py --symbol ETH
     python backtest_funding_arb.py --strategy buy_and_hold
 """
 
 import argparse
-from typing import Callable
+import json
+import os
+from itertools import product
+from typing import Any, Callable
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
@@ -105,6 +110,149 @@ STRATEGIES = {
 
 
 # ─────────────────────────────────────────────
+# ML 전략 함수
+# ─────────────────────────────────────────────
+# 기본 스케일 맵: (임계값, 포지션 비율)
+# predicted_fr > threshold → 해당 position_pct 적용
+DEFAULT_SCALE_MAP = [
+    (0.0002,          1.5),   # 높은 FR 예측 → 확대
+    (0.00005,         1.0),   # 보통 → 유지
+    (0.0,             0.5),   # 낮지만 양수 → 축소
+    (float("-inf"),   0.0),   # 음수 → 청산
+]
+
+CONSERVATIVE_SCALE_MAP = [
+    (0.0,             1.0),   # 양수 → 유지
+    (float("-inf"),   0.0),   # 음수 → 청산
+]
+
+AGGRESSIVE_SCALE_MAP = [
+    (0.0003,          1.5),   # 높은 FR → 확대
+    (0.0001,          1.0),   # 보통 → 유지
+    (0.00003,         0.5),   # 낮지만 양수 → 축소
+    (float("-inf"),   0.0),   # 음수 → 청산
+]
+
+
+# 타겟 스케일링 상수 (train_funding_predictor.py와 동일)
+TARGET_SCALE = 10000
+
+
+def _make_ml_strategy(
+    models: list,
+    feature_names: list[str],
+    fold_val_ends: list[pd.Timestamp],
+    scale_map: list[tuple[float, float]],
+) -> Callable:
+    """ML 예측 기반 포지션 스케일링 전략 팩토리.
+
+    Walk-Forward 원칙: 각 시점에서 해당 시점 이전에 학습된
+    가장 최신 fold 모델만 사용.
+
+    Args:
+        models: fold별 LightGBM 모델 리스트.
+        feature_names: 피처 이름 목록.
+        fold_val_ends: fold별 검증 종료 시점 (이 시점 이후부터 사용 가능).
+        scale_map: (threshold, position_pct) 튜플 리스트.
+
+    Returns:
+        전략 함수.
+    """
+    def strategy_fn(row: pd.Series, state: dict) -> dict:
+        ts = row["timestamp"]
+
+        # Walk-Forward: ts 시점에서 사용 가능한 가장 최신 fold 찾기
+        available = [
+            i for i, ve in enumerate(fold_val_ends)
+            if ve <= ts
+        ]
+
+        if not available:
+            # 아직 사용 가능한 모델 없음 → B&H 대리
+            if state["position"] == "flat":
+                return {"action": "open", "position_pct": 1.0}
+            return {"action": "hold"}
+
+        # 사용 가능한 모델들로 앙상블 예측
+        features = np.array([[row[f] for f in feature_names]])
+        # NaN 체크
+        if np.any(np.isnan(features)):
+            if state["position"] == "flat":
+                return {"action": "wait"}
+            return {"action": "hold"}
+
+        # 최신 2개 fold 앙상블 (사용 가능한 fold 중)
+        use_folds = available[-2:] if len(available) >= 2 else available
+        preds = [models[i].predict(features)[0] for i in use_folds]
+        # 모델은 스케일된 타겟으로 학습 → 역스케일링하여 원래 단위로 변환
+        predicted_fr = np.mean(preds) / TARGET_SCALE
+
+        # 스케일 맵으로 포지션 결정
+        target_pct = 0.0
+        for threshold, pct in scale_map:
+            if predicted_fr > threshold:
+                target_pct = pct
+                break
+
+        current_pct = state.get("position_pct", 0.0)
+
+        if state["position"] == "flat" and target_pct > 0:
+            return {"action": "open", "position_pct": target_pct}
+        elif state["position"] == "open" and target_pct == 0:
+            return {"action": "close"}
+        elif state["position"] == "open" and target_pct != current_pct:
+            return {"action": "resize", "position_pct": target_pct}
+        elif state["position"] == "flat" and target_pct == 0:
+            return {"action": "wait"}
+        else:
+            return {"action": "hold"}
+
+    return strategy_fn
+
+
+def load_ml_models(models_dir: str = "strategies/funding_arb/models") -> dict:
+    """학습된 ML 모델과 메타데이터를 로드한다.
+
+    Returns:
+        {"models": list, "feature_names": list, "fold_val_ends": list,
+         "training_meta": dict}
+    """
+    meta_path = os.path.join(models_dir, "training_meta.json")
+    features_path = os.path.join(models_dir, "feature_names.json")
+
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    with open(features_path, encoding="utf-8") as f:
+        feature_names = json.load(f)
+
+    n_folds = meta["n_folds"]
+    models = []
+    fold_val_ends = []
+
+    for i in range(n_folds):
+        fold_path = os.path.join(models_dir, f"fold_{i:02d}.txt")
+        booster = lgb.Booster(model_file=fold_path)
+        models.append(booster)
+
+        # fold의 검증 종료 시점
+        fold_metrics = meta["folds_metrics"][i]
+        val_period = fold_metrics.get("val_period", "")
+        # val_period: "2025-07-01 00:00:00+00:00 ~ 2025-08-01 00:00:00+00:00"
+        if "~" in val_period:
+            val_end_str = val_period.split("~")[1].strip()
+        else:
+            val_end_str = val_period.strip()
+        fold_val_ends.append(pd.Timestamp(val_end_str, tz="UTC"))
+
+    return {
+        "models": models,
+        "feature_names": feature_names,
+        "fold_val_ends": fold_val_ends,
+        "training_meta": meta,
+    }
+
+
+# ─────────────────────────────────────────────
 # 시뮬레이션 엔진
 # ─────────────────────────────────────────────
 def simulate_funding_arb(
@@ -151,7 +299,7 @@ def simulate_funding_arb(
     entry_cost_rate = spot_fee + perp_fee + slippage * 2
     exit_cost_rate = spot_fee + perp_fee + slippage * 2
 
-    state = {"position": "flat"}
+    state = {"position": "flat", "position_pct": 0.0}
 
     # 기록용
     equity_list = []
@@ -161,6 +309,7 @@ def simulate_funding_arb(
     total_funding_paid = 0.0
     total_costs = 0.0
     entry_idx = None
+    resize_count = 0
 
     for i, row in df.iterrows():
         ts = row["timestamp"]
@@ -185,6 +334,7 @@ def simulate_funding_arb(
             capital -= cost
             total_costs += cost
             state["position"] = "open"
+            state["position_pct"] = pct
             entry_idx = i
             trade_log.append({
                 "timestamp": ts,
@@ -209,7 +359,30 @@ def simulate_funding_arb(
             })
             position_size = 0.0
             state["position"] = "flat"
+            state["position_pct"] = 0.0
             entry_idx = None
+
+        elif action["action"] == "resize" and state["position"] == "open":
+            new_pct = action["position_pct"]
+            old_pct = state["position_pct"]
+            # 포지션 변경 비율의 차이만큼만 비용 발생
+            new_position_size = capital * new_pct
+            delta_size = abs(new_position_size - position_size)
+            cost = delta_size * entry_cost_rate
+            capital -= cost
+            total_costs += cost
+            position_size = new_position_size
+            state["position_pct"] = new_pct
+            resize_count += 1
+            trade_log.append({
+                "timestamp": ts,
+                "action": "resize",
+                "position_size": position_size,
+                "cost": cost,
+                "capital": capital,
+                "old_pct": old_pct,
+                "new_pct": new_pct,
+            })
 
         equity_list.append(capital)
         timestamps.append(ts)
@@ -583,16 +756,288 @@ def run_all(symbol: str = "BTC", single_strategy: str | None = None) -> None:
     print()
 
 
+# ─────────────────────────────────────────────
+# Phase 2: ML 강화 분석
+# ─────────────────────────────────────────────
+def _optimize_thresholds(
+    df: pd.DataFrame,
+    models: list,
+    feature_names: list[str],
+    fold_val_ends: list[pd.Timestamp],
+) -> list[tuple[float, float]]:
+    """IS+PV 구간에서 스케일링 임계값을 최적화한다.
+
+    Strict OOS 데이터는 사용하지 않음 (과적합 방지).
+    """
+    is_pv_df = filter_period(df, "2024-01-01", "2026-01-18")
+    if len(is_pv_df) < 10:
+        return DEFAULT_SCALE_MAP
+
+    # 그리드 탐색
+    close_below_grid = [-0.00005, 0.0, 0.00002]
+    reduce_below_grid = [0.00003, 0.00005, 0.00007]
+    expand_above_grid = [0.0001, 0.0002, 0.0003]
+
+    best_sharpe = -999.0
+    best_map = DEFAULT_SCALE_MAP
+
+    for cb, rb, ea in product(close_below_grid, reduce_below_grid, expand_above_grid):
+        if cb >= rb or rb >= ea:
+            continue  # 임계값 순서가 맞아야 함
+
+        trial_map = [
+            (ea,              1.5),
+            (rb,              1.0),
+            (cb,              0.5),
+            (float("-inf"),   0.0),
+        ]
+
+        fn = _make_ml_strategy(models, feature_names, fold_val_ends, trial_map)
+        result = simulate_funding_arb(is_pv_df, fn)
+        sharpe = result["sharpe_ratio"]
+
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_map = trial_map
+
+    return best_map
+
+
+def run_ml_analysis(symbol: str = "BTC") -> None:
+    """Phase 2 ML 강화 분석을 실행한다."""
+    df = load_data(symbol)
+
+    # 모델 로드
+    models_dir = "strategies/funding_arb/models"
+    try:
+        ml_data = load_ml_models(models_dir)
+    except FileNotFoundError:
+        print("ML 모델을 찾을 수 없습니다. 먼저 train_funding_predictor.py를 실행하세요.")
+        return
+
+    models = ml_data["models"]
+    feature_names = ml_data["feature_names"]
+    fold_val_ends = ml_data["fold_val_ends"]
+    meta = ml_data["training_meta"]
+
+    print(f"\n{'=' * 70}")
+    print(f"Phase 2: ML 강화 펀딩비 차익거래 결과")
+    print(f"심볼: {symbol}USDT | 데이터: {len(df)}건")
+    print(f"기간: {df['timestamp'].iloc[0].strftime('%Y-%m-%d')} ~ "
+          f"{df['timestamp'].iloc[-1].strftime('%Y-%m-%d')}")
+    print(f"{'=' * 70}")
+
+    # ── 1. 모델 학습 결과 ──
+    print(f"\n1. 모델 학습 결과")
+    folds_metrics = meta["folds_metrics"]
+
+    print(f"\n{'Fold':>4} | {'Val IC':>8} | {'Val MAE':>10} | {'Dir Acc':>8} | "
+          f"{'Neg Rec':>8}")
+    print("-" * 55)
+
+    for m in folds_metrics:
+        val_ic = m.get("val_ic", m.get("val_f1_macro", 0))
+        val_mae = m.get("val_mae", m.get("val_logloss", 0))
+        dir_acc = m.get("direction_accuracy", m.get("val_dir_acc", 0))
+        neg_rec = m.get("negative_recall", 0)
+        print(f"  {m['fold']:2d} | {val_ic:8.4f} | {val_mae:10.6f} | "
+              f"{dir_acc:7.1%} | {neg_rec:7.1%}")
+
+    avg_ic = np.mean([m.get("val_ic", m.get("val_f1_macro", 0)) for m in folds_metrics])
+    avg_mae = np.mean([m.get("val_mae", m.get("val_logloss", 0)) for m in folds_metrics])
+    avg_dir = np.mean([m.get("direction_accuracy", m.get("val_dir_acc", 0)) for m in folds_metrics])
+    avg_neg = np.mean([m.get("negative_recall", 0) for m in folds_metrics])
+    print("-" * 55)
+    print(f" AVG | {avg_ic:8.4f} | {avg_mae:10.6f} | {avg_dir:7.1%} | {avg_neg:7.1%}")
+
+    # ── 2. 임계값 최적화 ──
+    print(f"\n2. 스케일링 임계값 최적화 (IS+PV)")
+    optimized_map = _optimize_thresholds(df, models, feature_names, fold_val_ends)
+    print(f"  최적 scale_map:")
+    for threshold, pct in optimized_map:
+        if threshold == float("-inf"):
+            print(f"    FR <= {optimized_map[-2][0]:.6f}  → {pct:.0%}")
+        else:
+            print(f"    FR > {threshold:.6f}  → {pct:.0%}")
+
+    # ── 3. A/B 비교 (전체 기간) ──
+    print(f"\n3. A/B 비교 (전체 기간, 레버리지 1x)")
+    full_df = filter_period(df, *PERIODS["Full"])
+
+    ml_strategies: dict[str, Callable] = {
+        "A_buy_hold": strategy_buy_and_hold,
+        "B_conservative": _make_ml_strategy(
+            models, feature_names, fold_val_ends, CONSERVATIVE_SCALE_MAP),
+        "C_balanced": _make_ml_strategy(
+            models, feature_names, fold_val_ends, DEFAULT_SCALE_MAP),
+        "D_aggressive": _make_ml_strategy(
+            models, feature_names, fold_val_ends, AGGRESSIVE_SCALE_MAP),
+        "E_optimized": _make_ml_strategy(
+            models, feature_names, fold_val_ends, optimized_map),
+    }
+
+    ab_results: dict[str, dict] = {}
+    for name, fn in ml_strategies.items():
+        ab_results[name] = simulate_funding_arb(full_df, fn)
+
+    metrics_keys = [
+        ("연환산", "annualized_return_pct", "%"),
+        ("MDD", "max_drawdown_pct", "%"),
+        ("샤프", "sharpe_ratio", ""),
+        ("진입 횟수", "total_entries", ""),
+        ("총 비용", "total_costs", "$"),
+    ]
+
+    short_labels = {
+        "A_buy_hold": "A:B&H",
+        "B_conservative": "B:보수적",
+        "C_balanced": "C:균형",
+        "D_aggressive": "D:적극",
+        "E_optimized": "E:최적",
+    }
+
+    strat_names = list(ab_results.keys())
+    headers = ["메트릭"] + [short_labels.get(n, n) for n in strat_names]
+    rows = []
+    for label, key, unit in metrics_keys:
+        row = [label]
+        for name in strat_names:
+            val = ab_results[name][key]
+            if unit == "$":
+                row.append(f"${val:,.0f}")
+            elif unit == "%":
+                row.append(f"{val:+.2f}%")
+            else:
+                row.append(f"{val:.2f}")
+        rows.append(row)
+    print_table(headers, rows, col_width=10)
+
+    # ── 4. 최적 전략 구간별 성과 vs Buy & Hold ──
+    # 최적 ML 전략 = 전체 기간 샤프 최대
+    ml_only = {k: v for k, v in ab_results.items() if k != "A_buy_hold"}
+    best_ml_name = max(ml_only, key=lambda n: ml_only[n]["sharpe_ratio"])
+    best_ml_fn = ml_strategies[best_ml_name]
+
+    print(f"\n4. 최적 전략({short_labels[best_ml_name]}) 구간별 성과 vs Buy & Hold")
+
+    headers = ["구간", "B&H 수익률", "B&H 샤프", "ML 수익률", "ML 샤프"]
+    rows = []
+    period_ml_results = {}
+    period_bh_results = {}
+
+    for pname, (start, end) in PERIODS.items():
+        if pname == "Full":
+            continue
+        pdf = filter_period(df, start, end)
+        if len(pdf) < 3:
+            continue
+        bh_res = simulate_funding_arb(pdf, strategy_buy_and_hold)
+        ml_res = simulate_funding_arb(pdf, best_ml_fn)
+        period_bh_results[pname] = bh_res
+        period_ml_results[pname] = ml_res
+        rows.append([
+            pname,
+            f"{bh_res['total_return_pct']:+.2f}%",
+            f"{bh_res['sharpe_ratio']:.2f}",
+            f"{ml_res['total_return_pct']:+.2f}%",
+            f"{ml_res['sharpe_ratio']:.2f}",
+        ])
+    print_table(headers, rows, col_width=12)
+
+    # ── 5. v1 + ML 펀딩비 합산 (Strict OOS) ──
+    print(f"\n5. v1 + ML 펀딩비 합산 (Strict OOS)")
+
+    strict_df = filter_period(df, *PERIODS["Strict OOS"])
+    ml_strict_ret = 0.0
+    bh_strict_ret = 0.0
+    if len(strict_df) >= 3 and "Strict OOS" in period_ml_results:
+        ml_strict_ret = period_ml_results["Strict OOS"]["total_return_pct"]
+        bh_strict_ret = period_bh_results["Strict OOS"]["total_return_pct"]
+        v1_ret = V1_RETURNS.get("Strict OOS", -2.71)
+
+        headers = ["전략", "수익률"]
+        rows = [
+            ["v1 단독", f"{v1_ret:+.2f}%"],
+            ["B&H 펀딩비 단독", f"{bh_strict_ret:+.2f}%"],
+            ["ML 펀딩비 단독", f"{ml_strict_ret:+.2f}%"],
+            ["v1 50% + B&H 50%", f"{v1_ret * 0.5 + bh_strict_ret * 0.5:+.2f}%"],
+            ["v1 50% + ML 50%", f"{v1_ret * 0.5 + ml_strict_ret * 0.5:+.2f}%"],
+        ]
+        print_table(headers, rows, col_width=18)
+
+    # ── 6. 레버리지 최적 (ML 전략) ──
+    print(f"\n6. 레버리지 최적 ({short_labels[best_ml_name]}, MDD < -3% 기준)")
+
+    headers = ["레버리지", "연환산", "MDD", "샤프"]
+    rows = []
+    for lev in LEVERAGE_LEVELS:
+        res = simulate_funding_arb(full_df, best_ml_fn, leverage=lev)
+        rows.append([
+            f"{lev:.1f}x",
+            f"{res['annualized_return_pct']:+.2f}%",
+            f"{res['max_drawdown_pct']:+.2f}%",
+            f"{res['sharpe_ratio']:.2f}",
+        ])
+    print_table(headers, rows)
+
+    # ── 7. Phase 3 진입 판단 ──
+    print(f"\n7. Phase 3 진입 판단")
+
+    bh_full = ab_results["A_buy_hold"]
+    ml_full = ab_results[best_ml_name]
+    v1_ret_strict = V1_RETURNS.get("Strict OOS", -2.71)
+    combined_strict = v1_ret_strict * 0.5 + ml_strict_ret * 0.5
+
+    check_strict_oos = ml_strict_ret > bh_strict_ret
+    check_sharpe = ml_full["sharpe_ratio"] >= bh_full["sharpe_ratio"] * 0.8
+    check_combined = combined_strict > 0
+    check_neg_recall = avg_neg > 0.5
+
+    checks = [
+        (check_strict_oos,
+         f"ML Strict OOS > B&H: {ml_strict_ret:+.2f}% vs {bh_strict_ret:+.2f}%"),
+        (check_sharpe,
+         f"ML 전체 샤프 > B&H×0.8: {ml_full['sharpe_ratio']:.2f} vs "
+         f"{bh_full['sharpe_ratio'] * 0.8:.2f}"),
+        (check_combined,
+         f"v1+ML 합산 Strict OOS > 0%: {combined_strict:+.2f}%"),
+        (check_neg_recall,
+         f"Negative recall > 50%: {avg_neg:.1%}"),
+    ]
+
+    passed = 0
+    for ok, desc in checks:
+        status = "PASS" if ok else "FAIL"
+        print(f"  {'[v]' if ok else '[x]'} {status}: {desc}")
+        if ok:
+            passed += 1
+
+    print(f"\n  결과: {passed}/4 통과", end="")
+    if passed >= 3:
+        print(f" -> Phase 3(실행 인프라) 진행 권장 (전략: {short_labels[best_ml_name]})")
+    elif ml_full["sharpe_ratio"] < bh_full["sharpe_ratio"]:
+        print(f" -> ML이 B&H 대비 개선 없음. B&H 유지로 Phase 3 진행")
+    else:
+        print(f" -> Phase 3 진행 보류")
+
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="펀딩비 차익거래 백테스트")
     parser.add_argument("--symbol", default="BTC", choices=["BTC", "ETH"],
                         help="심볼 (기본: BTC)")
     parser.add_argument("--strategy", default=None,
                         choices=list(STRATEGIES.keys()),
-                        help="단일 전략만 실행")
+                        help="단일 전략만 실행 (Phase 1)")
+    parser.add_argument("--phase2", action="store_true",
+                        help="Phase 2 ML 강화 분석 실행")
     args = parser.parse_args()
 
-    run_all(symbol=args.symbol, single_strategy=args.strategy)
+    if args.phase2:
+        run_ml_analysis(symbol=args.symbol)
+    else:
+        run_all(symbol=args.symbol, single_strategy=args.strategy)
 
 
 if __name__ == "__main__":

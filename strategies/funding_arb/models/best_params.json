@@ -1,0 +1,20 @@
+{
+  "boosting_type": "gbdt",
+  "objective": "huber",
+  "metric": "mae",
+  "n_estimators": 584,
+  "num_leaves": 15,
+  "min_child_samples": 21,
+  "learning_rate": 0.08856780142042578,
+  "reg_alpha": 0.33494701961509815,
+  "reg_lambda": 0.29458288111890923,
+  "feature_fraction": 0.47541986573225925,
+  "bagging_fraction": 0.5292882991895527,
+  "bagging_freq": 1,
+  "max_depth": 5,
+  "huber_delta": 1.6878824995672916,
+  "verbose": -1,
+  "seed": 42,
+  "deterministic": true,
+  "num_threads": 1
+}
