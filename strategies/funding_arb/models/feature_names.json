@@ -1,0 +1,15 @@
+[
+  "fr_ma_3",
+  "fr_ma_7",
+  "fr_ma_21",
+  "fr_std_7",
+  "fr_zscore",
+  "return_8h",
+  "return_24h",
+  "volatility_24h",
+  "oi_change_8h",
+  "oi_change_24h",
+  "buy_ratio",
+  "hour_utc",
+  "day_of_week"
+]

@@ -43,8 +43,10 @@ class BaseStrategy(ABC):
 
         Returns:
             (signal, probability) 튜플.
-            signal: 1(매수) 또는 0(비매수).
-            probability: 매수 확률 (0.0 ~ 1.0). 자본 배분에 활용.
+            signal: 1(롱) / -1(숏) / 0(대기).
+            probability: 시그널 강도 (0.0 ~ 1.0).
+                분류: 매수 확률.
+                회귀: |예상 수익률| 정규화 값.
         """
         pass
 
@@ -57,6 +59,8 @@ class BaseStrategy(ABC):
 
         Returns:
             (signal_series, probability_series) 튜플.
+            signal_series: 1(롱) / -1(숏) / 0(대기).
+            probability_series: 시그널 강도 (0.0 ~ 1.0).
         """
         pass
 

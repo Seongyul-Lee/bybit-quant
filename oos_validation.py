@@ -127,6 +127,179 @@ def simulate_period(df_period, signals_period, sl_pct, tp_pct, max_hold,
     }
 
 
+def simulate_period_v2(
+    df_period, signals_period, confidences_period,
+    sl_pcts_period, tp_pcts_period,
+    max_hold=24, base_position_pct=0.20,
+    fee_per_side=0.00055, slippage_per_side=0.0,
+):
+    """양방향 + 동적 SL/TP + 동적 포지셔닝 시뮬레이션.
+
+    Args:
+        df_period: OHLCV 데이터프레임.
+        signals_period: 1(롱) / -1(숏) / 0(대기) 시리즈.
+        confidences_period: 0.0~1.0 시리즈 (포지셔닝 스케일).
+        sl_pcts_period: 각 봉의 SL 비율 시리즈 (동적).
+        tp_pcts_period: 각 봉의 TP 비율 시리즈 (동적).
+        max_hold: 최대 보유 기간 (봉 수).
+        base_position_pct: 기본 포지션 비율.
+        fee_per_side: 편도 수수료.
+        slippage_per_side: 편도 슬리피지.
+
+    Returns:
+        dict: 거래 통계 (롱/숏 분리 메트릭 포함).
+    """
+    close = df_period["close"].values
+    high = df_period["high"].values
+    low = df_period["low"].values
+    sigs = signals_period.values
+    confs = confidences_period.values
+    sls = sl_pcts_period.values
+    tps = tp_pcts_period.values
+    n = len(close)
+
+    trades = []
+    i = 0
+
+    while i < n:
+        if sigs[i] == 0:
+            i += 1
+            continue
+
+        direction = int(sigs[i])  # 1 or -1
+        entry_price = close[i]
+        sl_pct = sls[i]
+        tp_pct = tps[i]
+
+        # 포지션 크기 (confidence 비례)
+        scale = 0.25 + 0.75 * confs[i]
+        position_pct = base_position_pct * scale
+
+        # SL/TP 가격 계산
+        if direction == 1:  # 롱
+            sl_price = entry_price * (1 - sl_pct)
+            tp_price = entry_price * (1 + tp_pct)
+        else:  # 숏
+            sl_price = entry_price * (1 + sl_pct)
+            tp_price = entry_price * (1 - tp_pct)
+
+        exit_bar = None
+        exit_return = 0
+        exit_type = "timeout"
+
+        for j in range(i + 1, min(i + 1 + max_hold, n)):
+            if direction == 1:  # 롱
+                hit_tp = high[j] >= tp_price
+                hit_sl = low[j] <= sl_price
+            else:  # 숏
+                hit_tp = low[j] <= tp_price
+                hit_sl = high[j] >= sl_price
+
+            if hit_tp and hit_sl:
+                exit_bar = j
+                exit_return = -sl_pct  # 동시 터치: 보수적으로 SL
+                exit_type = "sl"
+                break
+            elif hit_tp:
+                exit_bar = j
+                exit_return = tp_pct
+                exit_type = "tp"
+                break
+            elif hit_sl:
+                exit_bar = j
+                exit_return = -sl_pct
+                exit_type = "sl"
+                break
+
+        if exit_bar is None:
+            exit_bar = min(i + max_hold, n - 1)
+            if direction == 1:
+                exit_return = (close[exit_bar] - entry_price) / entry_price
+            else:
+                exit_return = (entry_price - close[exit_bar]) / entry_price
+            exit_type = "timeout"
+
+        trades.append({
+            "direction": direction,
+            "entry_bar": i,
+            "exit_bar": exit_bar,
+            "return": exit_return,
+            "position_pct": position_pct,
+            "type": exit_type,
+        })
+
+        i = exit_bar + 1
+
+    if not trades:
+        return {
+            "trades": 0, "pf": 0, "total_return": 0, "win_rate": 0,
+            "mdd": 0, "tp_count": 0, "sl_count": 0, "timeout_count": 0,
+            "long_trades": 0, "short_trades": 0,
+            "long_win_rate": 0, "short_win_rate": 0,
+            "long_pf": 0, "short_pf": 0,
+            "avg_position_pct": 0,
+        }
+
+    # 수익률 계산 (동적 포지션 크기)
+    cumulative = 1.0
+    equity_curve = [1.0]
+    for t in trades:
+        total_cost = 2 * (fee_per_side + slippage_per_side)
+        pnl = t["position_pct"] * (t["return"] - total_cost)
+        cumulative *= (1 + pnl)
+        equity_curve.append(cumulative)
+
+    equity = np.array(equity_curve)
+    peak = np.maximum.accumulate(equity)
+    dd = (equity - peak) / peak
+    mdd = dd.min() * 100
+
+    returns = np.array([t["return"] for t in trades])
+    wins = returns > 0
+    gross_profit = returns[wins].sum() if wins.any() else 0
+    gross_loss = abs(returns[~wins].sum()) if (~wins).any() else 0.001
+    pf = gross_profit / gross_loss
+
+    types = [t["type"] for t in trades]
+
+    # 롱/숏 분리 메트릭
+    long_trades = [t for t in trades if t["direction"] == 1]
+    short_trades = [t for t in trades if t["direction"] == -1]
+
+    def _side_metrics(side_trades):
+        if not side_trades:
+            return 0, 0.0, 0.0
+        r = np.array([t["return"] for t in side_trades])
+        w = r > 0
+        wr = w.mean() * 100 if len(r) > 0 else 0.0
+        gp = r[w].sum() if w.any() else 0
+        gl = abs(r[~w].sum()) if (~w).any() else 0.001
+        return len(side_trades), wr, gp / gl
+
+    ln, lwr, lpf = _side_metrics(long_trades)
+    sn, swr, spf = _side_metrics(short_trades)
+
+    avg_pos = np.mean([t["position_pct"] for t in trades])
+
+    return {
+        "trades": len(trades),
+        "win_rate": wins.mean() * 100,
+        "pf": pf,
+        "total_return": (cumulative - 1) * 100,
+        "mdd": mdd,
+        "tp_count": types.count("tp"),
+        "sl_count": types.count("sl"),
+        "timeout_count": types.count("timeout"),
+        "long_trades": ln,
+        "short_trades": sn,
+        "long_win_rate": lwr,
+        "short_win_rate": swr,
+        "long_pf": lpf,
+        "short_pf": spf,
+        "avg_position_pct": avg_pos,
+    }
+
+
 def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
     """OOS 검증을 실행하고 결과를 출력.
 
@@ -194,42 +367,139 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
     X = df_feat[feature_names]
     valid_mask = ~X.isna().any(axis=1)
 
+    # 모드 판별
+    mode = params.get("mode", "classifier")
+
     signals = pd.Series(0, index=df.index, dtype=int)
-    proba_series = pd.Series(np.nan, index=df.index)
 
     if models:
-        preds = [m.predict(X[valid_mask]) for m in models]
-        proba = np.mean(preds, axis=0)
+        raw_preds = [m.predict(X[valid_mask]) for m in models]
+        proba = np.mean(raw_preds, axis=0)
     else:
         proba = model.predict(X[valid_mask])
 
-    proba_series.loc[valid_mask] = proba
+    if mode == "regressor":
+        # === 회귀 모드: 예측값 기반 양방향 시그널 ===
+        min_pred_threshold = params.get("min_pred_threshold", 0.005)
+        max_position_scale = params.get("max_position_scale", 2.0)
+        sl_atr_mult = params.get("sl_atr_mult", 2.0)
+        tp_atr_mult = params.get("tp_atr_mult", 3.0)
+        min_sl_pct = params.get("min_sl_pct", 0.01)
+        max_sl_pct = params.get("max_sl_pct", 0.05)
+        min_tp_pct = params.get("min_tp_pct", 0.01)
+        max_tp_pct = params.get("max_tp_pct", 0.08)
 
-    # 펀딩비 적응형 threshold
-    funding_filter = params.get("funding_filter", {})
-    if funding_filter.get("enabled", False) and "funding_rate_zscore" in df_feat.columns:
-        fr_zscore = df_feat["funding_rate_zscore"].values
-        zscore_thresholds = funding_filter.get("zscore_thresholds", [])
-        adaptive_thr = np.full(len(df), 999.0)
-        for rule in sorted(zscore_thresholds, key=lambda x: x["zscore_below"], reverse=True):
-            mask = fr_zscore < rule["zscore_below"]
-            adaptive_thr[mask] = rule["confidence"]
-        adaptive_thr[np.isnan(fr_zscore)] = CONFIDENCE_THRESHOLD
-        print(f"펀딩비 적응형 threshold 적용: {zscore_thresholds}")
+        # 예측값 중심화: expanding mean을 빼서 양방향 시그널 가능하게 함
+        demean_window = params.get("pred_demean_window", 720)
+        pred_series = pd.Series(proba)
+        expanding_mean = pred_series.rolling(window=demean_window, min_periods=100).mean()
+        proba_centered = (pred_series - expanding_mean).values.copy()
+        # rolling mean이 NaN인 초기 구간은 전체 expanding mean 사용
+        nan_mask = np.isnan(proba_centered)
+        if nan_mask.any():
+            global_mean = pred_series.iloc[:demean_window].mean()
+            proba_centered[nan_mask] = proba[nan_mask] - global_mean
+        print(f"예측값 중심화: demean_window={demean_window}, "
+              f"centered mean={proba_centered.mean():.6f}, std={proba_centered.std():.6f}")
+        proba = proba_centered
+
+        abs_preds = np.abs(proba)
+
+        # 펀딩비 적응형 threshold (수익률 단위)
+        funding_filter = params.get("funding_filter", {})
+        if funding_filter.get("enabled", False) and "funding_rate_zscore" in df_feat.columns:
+            fr_zscore = df_feat.loc[valid_mask, "funding_rate_zscore"].values
+            zscore_thresholds = funding_filter.get("zscore_thresholds", [])
+            adaptive_thr = np.full(len(proba), 999.0)
+            for rule in sorted(zscore_thresholds, key=lambda x: x["zscore_below"], reverse=True):
+                mask = fr_zscore < rule["zscore_below"]
+                adaptive_thr[mask] = rule["confidence"]
+            adaptive_thr[np.isnan(fr_zscore)] = min_pred_threshold
+            print(f"펀딩비 적응형 threshold 적용: {zscore_thresholds}")
+        else:
+            adaptive_thr = np.full(len(proba), min_pred_threshold)
+
+        # OI 필터
+        oi_filter = params.get("oi_filter", {})
+        if oi_filter.get("enabled", False) and "oi_zscore" in df_feat.columns:
+            oi_block = oi_filter.get("block_zscore")
+            if oi_block is not None:
+                oi_z = df_feat.loc[valid_mask, "oi_zscore"].values
+                block_mask = (oi_z >= oi_block) & ~np.isnan(oi_z)
+                adaptive_thr[block_mask] = 999.0
+                print(f"OI 필터 적용: block_zscore >= {oi_block}")
+
+        # 양방향 시그널 생성
+        long_mask = (proba > 0) & (abs_preds >= adaptive_thr)
+        short_mask = (proba < 0) & (abs_preds >= adaptive_thr)
+        signal_values = np.zeros(len(proba), dtype=int)
+        signal_values[long_mask] = 1
+        signal_values[short_mask] = -1
+        signals.loc[valid_mask] = signal_values
+
+        # confidence 시리즈
+        confidences = pd.Series(0.0, index=df.index, dtype=float)
+        conf_values = np.minimum(abs_preds / (min_pred_threshold * max_position_scale), 1.0)
+        conf_values[signal_values == 0] = 0.0
+        confidences.loc[valid_mask] = conf_values
+
+        # 동적 SL/TP 시리즈
+        fallback_sl = risk.get("stop_loss_pct", 0.021)
+        fallback_tp = risk.get("take_profit_pct", 0.021)
+        if "atr_14" in df_feat.columns:
+            atr_pct = (df_feat["atr_14"] / df_feat["close"]).values
+            sl_pcts = pd.Series(
+                np.clip(atr_pct * sl_atr_mult, min_sl_pct, max_sl_pct),
+                index=df.index,
+            )
+            tp_pcts = pd.Series(
+                np.clip(atr_pct * tp_atr_mult, min_tp_pct, max_tp_pct),
+                index=df.index,
+            )
+            # NaN 행에 fallback
+            sl_pcts = sl_pcts.fillna(fallback_sl)
+            tp_pcts = tp_pcts.fillna(fallback_tp)
+        else:
+            sl_pcts = pd.Series(fallback_sl, index=df.index)
+            tp_pcts = pd.Series(fallback_tp, index=df.index)
+
     else:
-        adaptive_thr = np.full(len(df), CONFIDENCE_THRESHOLD)
+        # === 분류 모드 ===
+        # 숏 전략 자동 감지: labeler_type이 short_triple_barrier이면 숏
+        is_short = params.get("labeler_type", "") == "short_triple_barrier"
 
-    # OI 필터
-    oi_filter = params.get("oi_filter", {})
-    if oi_filter.get("enabled", False) and "oi_zscore" in df_feat.columns:
-        oi_block = oi_filter.get("block_zscore")
-        if oi_block is not None:
-            oi_z = df_feat["oi_zscore"].values
-            block_mask = (oi_z >= oi_block) & ~np.isnan(oi_z)
-            adaptive_thr[block_mask] = 999.0
-            print(f"OI 필터 적용: block_zscore >= {oi_block}")
+        proba_series = pd.Series(np.nan, index=df.index)
+        proba_series.loc[valid_mask] = proba
 
-    signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
+        # 펀딩비 적응형 threshold
+        funding_filter = params.get("funding_filter", {})
+        if funding_filter.get("enabled", False) and "funding_rate_zscore" in df_feat.columns:
+            fr_zscore = df_feat["funding_rate_zscore"].values
+            zscore_thresholds = funding_filter.get("zscore_thresholds", [])
+            adaptive_thr = np.full(len(df), 999.0)
+            for rule in sorted(zscore_thresholds, key=lambda x: x["zscore_below"], reverse=True):
+                mask = fr_zscore < rule["zscore_below"]
+                adaptive_thr[mask] = rule["confidence"]
+            adaptive_thr[np.isnan(fr_zscore)] = CONFIDENCE_THRESHOLD
+            print(f"펀딩비 적응형 threshold 적용: {zscore_thresholds}")
+        else:
+            adaptive_thr = np.full(len(df), CONFIDENCE_THRESHOLD)
+
+        # OI 필터
+        oi_filter = params.get("oi_filter", {})
+        if oi_filter.get("enabled", False) and "oi_zscore" in df_feat.columns:
+            oi_block = oi_filter.get("block_zscore")
+            if oi_block is not None:
+                oi_z = df_feat["oi_zscore"].values
+                block_mask = (oi_z >= oi_block) & ~np.isnan(oi_z)
+                adaptive_thr[block_mask] = 999.0
+                print(f"OI 필터 적용: block_zscore >= {oi_block}")
+
+        if is_short:
+            # 숏 전략: threshold 이상이면 -1(숏)
+            signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], -1, 0)
+        else:
+            signals.loc[valid_mask] = np.where(proba >= adaptive_thr[valid_mask], 1, 0)
 
     ts = pd.to_datetime(df["timestamp"])
 
@@ -248,16 +518,27 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
 
     # 결과 출력
     print("=" * 80)
-    print("OOS 검증")
+    print(f"OOS 검증 (mode={mode})")
     print("=" * 80)
-    print(f"confidence_threshold: {CONFIDENCE_THRESHOLD}")
-    print(f"SL: {SL_PCT*100}% / TP: {TP_PCT*100}%")
+
+    if mode == "regressor":
+        print(f"min_pred_threshold: {params.get('min_pred_threshold', 0.005)}")
+        print(f"동적 SL/TP: sl_atr_mult={params.get('sl_atr_mult', 2.0)}, tp_atr_mult={params.get('tp_atr_mult', 3.0)}")
+    else:
+        print(f"confidence_threshold: {CONFIDENCE_THRESHOLD}")
+        print(f"SL: {SL_PCT*100}% / TP: {TP_PCT*100}%")
     print(f"Max Hold: {MAX_HOLD}")
     print(f"Post-Val: {val_end_ts} ~ {oos_boundary}")
     print()
 
+    # 숏 시그널 존재 여부 확인
+    has_short = (signals == -1).any()
+
     # 시그널 분포
-    print(f"전체 시그널: 매수={int((signals==1).sum())}, 비매수={int((signals==0).sum())}")
+    if mode == "regressor" or has_short:
+        print(f"전체 시그널: 롱={int((signals==1).sum())}, 숏={int((signals==-1).sum())}, 대기={int((signals==0).sum())}")
+    else:
+        print(f"전체 시그널: 매수={int((signals==1).sum())}, 비매수={int((signals==0).sum())}")
     print()
 
     # 시나리오 정의: (이름, slippage_per_side)
@@ -273,8 +554,14 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
         print(f"\n{'='*80}")
         print(f"시나리오: {scenario_name} - 슬리피지 편도 {slippage*100:.2f}%, 왕복 총비용 {total_cost_round:.2f}%")
         print(f"{'='*80}")
-        print(f"{'구간':<30} {'거래':>5} {'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7}")
-        print("-" * 70)
+
+        use_v2 = mode == "regressor" or has_short
+
+        if use_v2:
+            print(f"{'구간':<30} {'거래':>5} {'롱':>4} {'숏':>4} {'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7}")
+        else:
+            print(f"{'구간':<30} {'거래':>5} {'승률':>6} {'PF':>6} {'수익률':>8} {'MDD':>7}")
+        print("-" * 80)
 
         results = {}
         for name, (start, end) in periods.items():
@@ -283,19 +570,49 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
             if len(idx) == 0:
                 print(f"{name:<30} 데이터 없음")
                 continue
-            result = simulate_period(
-                df.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
-                signals.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
-                SL_PCT, TP_PCT, MAX_HOLD, POSITION_PCT, FEE_PER_SIDE,
-                slippage_per_side=slippage,
-            )
+
+            if use_v2:
+                # 양방향 시뮬레이션 (regressor 또는 숏 전략)
+                if mode == "regressor":
+                    conf_slice = confidences.iloc[idx[0]:idx[-1]+1].reset_index(drop=True)
+                    sl_slice = sl_pcts.iloc[idx[0]:idx[-1]+1].reset_index(drop=True)
+                    tp_slice = tp_pcts.iloc[idx[0]:idx[-1]+1].reset_index(drop=True)
+                else:
+                    # 숏 분류 모델: confidence 고정 1.0, SL/TP 고정
+                    n_slice = idx[-1] - idx[0] + 1
+                    conf_slice = pd.Series(1.0, index=range(n_slice))
+                    sl_slice = pd.Series(SL_PCT, index=range(n_slice))
+                    tp_slice = pd.Series(TP_PCT, index=range(n_slice))
+
+                result = simulate_period_v2(
+                    df.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
+                    signals.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
+                    conf_slice,
+                    sl_slice,
+                    tp_slice,
+                    MAX_HOLD, POSITION_PCT, FEE_PER_SIDE,
+                    slippage_per_side=slippage,
+                )
+            else:
+                result = simulate_period(
+                    df.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
+                    signals.iloc[idx[0]:idx[-1]+1].reset_index(drop=True),
+                    SL_PCT, TP_PCT, MAX_HOLD, POSITION_PCT, FEE_PER_SIDE,
+                    slippage_per_side=slippage,
+                )
+
             results[name] = result
             if result["trades"] == 0:
                 print(f"{name:<30} 거래 없음")
                 continue
             r = result
-            print(f"{name:<30} {r['trades']:>5} {r['win_rate']:>5.1f}% {r['pf']:>6.2f} "
-                  f"{r['total_return']:>+7.2f}% {r['mdd']:>6.2f}%")
+            if use_v2:
+                print(f"{name:<30} {r['trades']:>5} {r['long_trades']:>4} {r['short_trades']:>4} "
+                      f"{r['win_rate']:>5.1f}% {r['pf']:>6.2f} "
+                      f"{r['total_return']:>+7.2f}% {r['mdd']:>6.2f}%")
+            else:
+                print(f"{name:<30} {r['trades']:>5} {r['win_rate']:>5.1f}% {r['pf']:>6.2f} "
+                      f"{r['total_return']:>+7.2f}% {r['mdd']:>6.2f}%")
 
         all_scenario_results[scenario_name] = results
 
@@ -340,6 +657,12 @@ def run_oos_validation(strategy_name: str = "btc_1h_momentum"):
 
     print(f"\n  IS PF: {is_pf:.2f} → 보수적 PV PF: {pv_pf:.2f} (하락률: {pf_drop:.1f}%)")
     print(f"  낙관적 PV PF: {opt_pv_pf:.2f}")
+
+    # 회귀 모드: 롱/숏 분리 정보
+    if mode == "regressor" and pv_result.get("long_trades", 0) + pv_result.get("short_trades", 0) > 0:
+        print(f"\n  --- PV 롱/숏 분리 (보수적) ---")
+        print(f"  롱: {pv_result.get('long_trades', 0)}건, 승률 {pv_result.get('long_win_rate', 0):.1f}%, PF {pv_result.get('long_pf', 0):.2f}")
+        print(f"  숏: {pv_result.get('short_trades', 0)}건, 승률 {pv_result.get('short_win_rate', 0):.1f}%, PF {pv_result.get('short_pf', 0):.2f}")
 
     all_passed = all(checks.values())
     print(f"\n최종 결과: {'SUCCESS' if all_passed else 'FAIL'}")

@@ -10,12 +10,14 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
 
+from src.utils.config import merge_strategy_params
 from src.utils.logger import setup_logger
 
 logger = setup_logger("main")
@@ -34,15 +36,38 @@ def load_strategy(strategy_name: str):
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    params = merge_strategy_params(config)
+
     if strategy_name == "btc_1h_momentum":
         from strategies.btc_1h_momentum.strategy import LGBMClassifierStrategy
-        return LGBMClassifierStrategy(config=config.get("params", {}))
+        return LGBMClassifierStrategy(config=params)
     elif strategy_name == "eth_1h_momentum":
         from strategies.eth_1h_momentum.strategy import LGBMClassifierStrategy as ETHStrategy
-        return ETHStrategy(config=config.get("params", {}))
+        return ETHStrategy(config=params)
     elif strategy_name == "btc_1h_mean_reversion":
         from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
-        return MeanReversionStrategy(config=config.get("params", {}))
+        return MeanReversionStrategy(config=params)
+    elif strategy_name == "btc_1h_momentum_v2":
+        from strategies.btc_1h_momentum_v2.strategy import BTCMomentumV2Strategy
+        return BTCMomentumV2Strategy(config=params)
+    elif strategy_name == "eth_1h_momentum_v2":
+        from strategies.eth_1h_momentum_v2.strategy import ETHMomentumV2Strategy
+        return ETHMomentumV2Strategy(config=params)
+    elif strategy_name == "btc_1h_mean_reversion_v2":
+        from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
+        return BTCMeanReversionV2Strategy(config=params)
+    elif strategy_name == "btc_1h_momentum_short":
+        from strategies.btc_1h_momentum_short.strategy import BTCMomentumShortStrategy
+        return BTCMomentumShortStrategy(config=params)
+    elif strategy_name == "eth_1h_momentum_short":
+        from strategies.eth_1h_momentum_short.strategy import ETHMomentumShortStrategy
+        return ETHMomentumShortStrategy(config=params)
+    elif strategy_name == "btc_1h_mean_reversion_short":
+        from strategies.btc_1h_mean_reversion_short.strategy import BTCMeanReversionShortStrategy
+        return BTCMeanReversionShortStrategy(config=params)
+    elif strategy_name == "funding_arb":
+        from strategies.funding_arb.strategy import FundingArbStrategy
+        return FundingArbStrategy(config=params)
     else:
         raise ValueError(f"알 수 없는 전략: {strategy_name}")
 
@@ -151,6 +176,269 @@ def _load_portfolio_config() -> dict:
     return raw.get("portfolio", raw)
 
 
+def _load_funding_arb_config(portfolio_config: dict) -> dict | None:
+    """펀딩비 차익거래 설정 로드.
+
+    portfolio.yaml의 funding_arb 섹션에서 config_path를 읽어
+    전략 config.yaml을 로드한다.
+
+    Args:
+        portfolio_config: portfolio.yaml의 portfolio 섹션.
+
+    Returns:
+        차익거래 설정 딕셔너리. 비활성화 또는 파일 없으면 None.
+    """
+    arb_section = portfolio_config.get("funding_arb", {})
+    if not arb_section.get("enabled", False):
+        return None
+
+    config_path = arb_section.get("config_path", "strategies/funding_arb/config.yaml")
+    if not os.path.exists(config_path):
+        logger.warning(f"펀딩비 차익거래 설정 파일 없음: {config_path}")
+        return None
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        arb_config = yaml.safe_load(f)
+
+    # portfolio.yaml의 capital_pct를 params에 병합
+    if "params" in arb_config:
+        arb_config["params"]["capital_pct"] = arb_section.get("capital_pct", 0.40)
+
+    return arb_config
+
+
+def _run_funding_arb_check(
+    arb_executor,
+    arb_config: dict,
+    portfolio_value: float,
+    notifier,
+    state: dict,
+    log_prefix: str,
+    arb_risk_monitor=None,
+) -> None:
+    """펀딩비 차익거래 상태 체크 + 관리.
+
+    매 폴링마다 실행 (기존 루프에 통합).
+
+    로직:
+    1. 포지션이 없으면 → 진입 (Buy & Hold)
+    2. 포지션이 있으면 → 델타 체크 + 리스크 체크
+    3. 한쪽만 있으면 → 비정상 알림
+
+    Args:
+        arb_executor: ArbExecutor 인스턴스.
+        arb_config: 차익거래 설정 딕셔너리.
+        portfolio_value: 현재 포트폴리오 가치 (USDT).
+        notifier: TelegramNotifier 인스턴스.
+        state: 현재 상태 딕셔너리 (funding_arb 키 포함).
+        log_prefix: 로그 접두사 (예: "[TESTNET] ").
+        arb_risk_monitor: ArbRiskMonitor 인스턴스 (None이면 리스크 체크 스킵).
+    """
+    symbols = arb_config.get("strategy", {}).get("symbols", [])
+    params = arb_config.get("params", {})
+    max_delta_pct = params.get("max_delta_pct", 0.05)
+    rebalance_delta_pct = params.get("rebalance_delta_pct", 0.03)
+    capital_pct = params.get("capital_pct", 0.40)
+
+    if "funding_arb" not in state:
+        state["funding_arb"] = {}
+
+    for sym_pair in symbols:
+        symbol_spot = sym_pair["spot"]
+        symbol_perp = sym_pair["perp"]
+        coin = sym_pair["coin"]
+
+        # 현재 포지션 확인
+        spot_balance = arb_executor.spot.get_balance(coin)
+        has_spot = spot_balance > 0.001 if coin == "BTC" else spot_balance > 0.01
+
+        perp_positions = arb_executor.perp.sync_positions()
+        perp_pos = perp_positions.get(symbol_perp, {})
+        has_perp = perp_pos.get("side") == "short" and float(perp_pos.get("size", 0)) > 0
+
+        if not has_spot and not has_perp:
+            # 포지션 없음 → 진입
+            if portfolio_value <= 0:
+                logger.warning("포트폴리오 가치 0 — 차익거래 진입 불가")
+                continue
+
+            capital_for_arb = portfolio_value * capital_pct / len(symbols)
+            spot_price = arb_executor.spot.get_spot_price(symbol_spot)
+            if spot_price <= 0:
+                logger.warning(f"현물 가격 조회 실패 — {coin} 차익거래 진입 스킵")
+                continue
+
+            # 자본의 절반이 현물, 절반이 선물 마진
+            amount = capital_for_arb / spot_price / 2
+
+            logger.info(
+                f"[펀딩비 차익] {coin} 진입 시도: "
+                f"현물 {amount:.6f} + 선물 숏 {amount:.6f}"
+            )
+
+            result = arb_executor.open_position(symbol_spot, symbol_perp, amount)
+
+            if result["success"]:
+                msg = (
+                    f"{log_prefix}[펀딩비 차익] 진입 완료: "
+                    f"{coin} 현물 {amount:.6f} + 선물 숏 {amount:.6f} "
+                    f"(delta={result['delta']:.6f})"
+                )
+                notifier.send_sync(msg)
+                logger.info(msg)
+                state["funding_arb"][coin] = {
+                    "amount": amount,
+                    "entry_time": result["entry_time"],
+                    "entry_price": spot_price,
+                    "total_funding_collected": 0.0,
+                }
+
+                # 진입 슬리피지 리스크 체크
+                if arb_risk_monitor and result.get("spot_fill_price") and result.get("perp_fill_price"):
+                    slip = arb_risk_monitor.check_entry_slippage(
+                        result["spot_fill_price"], result["perp_fill_price"]
+                    )
+                    if slip["level"] == "warn":
+                        notifier.send_sync(f"{log_prefix}[펀딩비 차익] ⚠️ {slip['message']}")
+            else:
+                msg = f"{log_prefix}[펀딩비 차익] {coin} 진입 실패"
+                notifier.send_sync(msg)
+                logger.error(msg)
+
+        elif has_spot and has_perp:
+            # 포지션 있음 → 델타 체크
+            delta = arb_executor.get_delta(symbol_spot, symbol_perp)
+            delta_pct = abs(delta) / max(spot_balance, 0.001)
+
+            if delta_pct > max_delta_pct:
+                msg = (
+                    f"{log_prefix}[펀딩비 차익] 델타 초과: "
+                    f"{coin} delta={delta:.6f} ({delta_pct:.1%})"
+                )
+                notifier.send_sync(msg)
+                logger.warning(msg)
+            elif delta_pct > rebalance_delta_pct:
+                logger.info(
+                    f"[펀딩비 차익] 델타 주의: "
+                    f"{coin} delta={delta:.6f} ({delta_pct:.1%})"
+                )
+            else:
+                logger.debug(
+                    f"[펀딩비 차익] {coin} 정상: delta={delta:.6f} ({delta_pct:.1%})"
+                )
+
+            # === 리스크 체크 (ArbRiskMonitor) ===
+            if arb_risk_monitor:
+                try:
+                    spot_price = arb_executor.spot.get_spot_price(symbol_spot)
+                    perp_ticker = arb_executor.perp.exchange.fetch_ticker(symbol_perp)
+                    perp_price = float(perp_ticker["last"]) if perp_ticker else 0
+
+                    if spot_price > 0 and perp_price > 0:
+                        basis_result = arb_risk_monitor.check_basis(spot_price, perp_price, coin=coin)
+                        if basis_result["level"] == "critical":
+                            if arb_risk_monitor.should_send_alert(f"basis_{coin}", "critical"):
+                                notifier.send_sync(
+                                    f"{log_prefix}[펀딩비 차익] ⚠️ {basis_result['message']}"
+                                )
+                        elif basis_result["level"] == "warn":
+                            logger.warning(f"[펀딩비 차익] {basis_result['message']}")
+
+                    margin_result = arb_risk_monitor.check_margin(
+                        arb_executor.perp.exchange, symbol_perp
+                    )
+                    if margin_result["level"] == "critical":
+                        if arb_risk_monitor.should_send_alert(f"margin_{coin}", "critical"):
+                            notifier.send_sync(
+                                f"{log_prefix}[펀딩비 차익] 🚨 {margin_result['message']}"
+                            )
+                    elif margin_result["level"] == "warn":
+                        if arb_risk_monitor.should_send_alert(f"margin_{coin}", "warn"):
+                            notifier.send_sync(
+                                f"{log_prefix}[펀딩비 차익] ⚠️ {margin_result['message']}"
+                            )
+                except Exception as e:
+                    logger.warning(f"[펀딩비 차익] 리스크 체크 오류 ({coin}): {e}")
+
+        else:
+            # 한쪽만 있음 → 비정상
+            msg = (
+                f"{log_prefix}[펀딩비 차익] 비대칭 포지션: "
+                f"{coin} spot={has_spot} (bal={spot_balance:.6f}), "
+                f"perp={has_perp}"
+            )
+            notifier.send_sync(msg)
+            logger.error(msg)
+
+
+def _check_funding_settlement(
+    arb_executor,
+    notifier,
+    last_check_time: datetime,
+    state: dict,
+    log_prefix: str,
+    arb_risk_monitor=None,
+) -> datetime:
+    """펀딩비 결제 확인.
+
+    UTC 0:00, 8:00, 16:00 이후 10분 내에 1회 실행.
+    Bybit API로 실제 수취 금액을 확인하고 텔레그램으로 알림.
+
+    Args:
+        arb_executor: ArbExecutor 인스턴스.
+        notifier: TelegramNotifier.
+        last_check_time: 마지막 결제 확인 시간.
+        state: 현재 상태 (funding_arb 키 포함).
+        log_prefix: 로그 접두사.
+        arb_risk_monitor: ArbRiskMonitor 인스턴스 (None이면 추세 체크 스킵).
+
+    Returns:
+        업데이트된 마지막 확인 시간.
+    """
+    now = datetime.now(timezone.utc)
+    funding_hours = [0, 8, 16]
+
+    # 현재가 결제 후 10분 이내인지 확인
+    if now.hour not in funding_hours or now.minute >= 10:
+        return last_check_time
+
+    # 중복 체크 방지 (1시간 이내 재확인 방지)
+    if (now - last_check_time).total_seconds() < 3600:
+        return last_check_time
+
+    arb_state = state.get("funding_arb", {})
+    funding_msgs = []
+
+    for coin, pos_info in arb_state.items():
+        symbol_perp = f"{coin}/USDT:USDT"
+        income = arb_executor.get_funding_income(symbol_perp)
+        if income is not None:
+            pos_info["total_funding_collected"] = (
+                pos_info.get("total_funding_collected", 0.0) + income
+            )
+            funding_msgs.append(f"{coin} {income:+.4f} USDT")
+
+            # 펀딩비 추세 체크
+            if arb_risk_monitor:
+                trend = arb_risk_monitor.check_funding_trend(income, coin=coin)
+                if trend["level"] == "critical":
+                    notifier.send_sync(
+                        f"{log_prefix}[펀딩비 차익] 🚨 {trend['message']} — 수동 청산 검토"
+                    )
+                elif trend["level"] == "warn":
+                    if arb_risk_monitor.should_send_alert(f"funding_trend_{coin}", "warn"):
+                        notifier.send_sync(
+                            f"{log_prefix}[펀딩비 차익] ⚠️ {trend['message']}"
+                        )
+
+    if funding_msgs:
+        msg = f"{log_prefix}[펀딩비] 결제 확인: {', '.join(funding_msgs)}"
+        notifier.send_sync(msg)
+        logger.info(msg)
+
+    return now
+
+
 def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     """실거래 모드 실행.
 
@@ -195,6 +483,115 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     log_prefix = "[TESTNET] " if testnet else ""
     state_path = STATE_PATH_TESTNET if testnet else STATE_PATH_MAINNET
 
+    # === v1 전략이 사용하는 perp 심볼 (ARB 충돌 방지용) ===
+    v1_perp_symbols: set[str] = set()
+    for name in portfolio_manager.get_active_strategies():
+        cfg = portfolio_manager.get_strategy_config(name)
+        sym_raw = cfg.get("strategy", {}).get("symbol", "BTCUSDT")
+        v1_perp_symbols.add(_convert_symbol(sym_raw))
+
+    # === Hedge Mode (Both Sides) 설정 ===
+    # Hedge Mode에서는 같은 심볼에 롱(positionIdx=1)과 숏(positionIdx=2)을 동시 보유 가능.
+    # v1 전략은 positionIdx=1(Buy side), funding_arb는 positionIdx=2(Sell side)로 분리.
+    hedge_mode_symbols_active: set[str] = set()
+    hedge_mode_symbols: set[str] = set()
+
+    arb_config_tmp = _load_funding_arb_config(portfolio_config)
+    if arb_config_tmp:
+        arb_symbols_tmp = arb_config_tmp.get("strategy", {}).get("symbols", [])
+        # v1과 겹치는 심볼에 대해 Hedge Mode 전환 시도
+        hedge_mode_symbols = {s["perp"] for s in arb_symbols_tmp if s["perp"] in v1_perp_symbols}
+
+        if hedge_mode_symbols:
+            for sym in hedge_mode_symbols:
+                try:
+                    exchange.set_position_mode(True, sym)
+                    logger.info(f"Hedge Mode 전환 성공: {sym}")
+                    hedge_mode_symbols_active.add(sym)
+                except Exception as e:
+                    err_msg = str(e)
+                    # 이미 Hedge Mode인 경우도 성공으로 처리
+                    if "already" in err_msg.lower() or "position mode is not modified" in err_msg.lower():
+                        logger.info(f"Hedge Mode 이미 활성: {sym}")
+                        hedge_mode_symbols_active.add(sym)
+                    else:
+                        logger.warning(f"Hedge Mode 전환 실패: {sym} — {e}")
+
+            if hedge_mode_symbols_active:
+                logger.info(
+                    f"Hedge Mode 활성화 완료: {hedge_mode_symbols_active} — "
+                    f"v1(positionIdx=1)과 arb(positionIdx=2) 동시 운용 가능"
+                )
+            else:
+                logger.warning(
+                    "Hedge Mode 전환 실패 — One-Way Mode + 하드 가드 유지"
+                )
+
+    # === 펀딩비 차익거래 초기화 ===
+    arb_executor = None
+    arb_config = None
+    arb_risk_monitor = None
+    funding_arb_state: dict = {}
+    last_funding_check = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    arb_config = _load_funding_arb_config(portfolio_config)
+    if arb_config:
+        arb_symbols = arb_config.get("strategy", {}).get("symbols", [])
+
+        if hedge_mode_symbols_active:
+            # Hedge Mode에서는 v1과 동일 심볼도 허용
+            filtered = arb_symbols
+            if hedge_mode_symbols_active & v1_perp_symbols:
+                logger.info(
+                    f"Hedge Mode: v1 충돌 심볼 허용 — {hedge_mode_symbols & v1_perp_symbols}"
+                )
+        else:
+            # One-Way Mode 폴백: 기존 하드 가드 유지
+            blocked = [s["perp"] for s in arb_symbols if s["perp"] in v1_perp_symbols]
+            filtered = [s for s in arb_symbols if s["perp"] not in v1_perp_symbols]
+
+            if blocked:
+                logger.warning(
+                    f"funding_arb 심볼 충돌 차단: {blocked} "
+                    f"(v1 전략과 동일 perp 심볼 — NET 포지션 모드 충돌 방지)"
+                )
+                if not filtered:
+                    logger.warning(
+                        "funding_arb 전체 심볼이 v1 전략과 충돌 — "
+                        "차익거래 비활성화 (별도 서브계정 사용 권장)"
+                    )
+        arb_config["strategy"]["symbols"] = filtered
+
+    if arb_config and arb_config.get("strategy", {}).get("symbols"):
+        try:
+            from src.execution.spot_executor import SpotExecutor
+            from src.execution.arb_executor import ArbExecutor
+            from src.risk.arb_monitor import ArbRiskMonitor
+
+            spot_executor = SpotExecutor(testnet=testnet)
+            arb_executor = ArbExecutor(spot_executor, executor)
+            arb_risk_monitor = ArbRiskMonitor(arb_config.get("risk", {}))
+
+            # 차익거래 심볼에도 레버리지 설정
+            arb_leverage = arb_config.get("params", {}).get("leverage", 2)
+            for sym_pair in arb_config["strategy"]["symbols"]:
+                try:
+                    exchange.set_leverage(arb_leverage, sym_pair["perp"])
+                    logger.info(
+                        f"차익거래 레버리지 설정: {arb_leverage}x ({sym_pair['perp']})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"차익거래 레버리지 설정 실패 ({sym_pair['perp']}): {e}"
+                    )
+
+            logger.info("펀딩비 차익거래 모듈 초기화 완료")
+        except Exception as e:
+            logger.error(f"펀딩비 차익거래 초기화 실패: {e}")
+            arb_executor = None
+    else:
+        logger.info("펀딩비 차익거래 비활성화")
+
     # 레버리지 설정
     leverage = risk_manager.params["position"]["max_leverage"]
     # 활성 전략의 심볼 집합
@@ -227,6 +624,14 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
 
     last_processed_bars: dict[str, str] = saved_state.get("last_processed_bars", {})
     last_trade_ids: set = set(saved_state.get("last_trade_ids", []))
+
+    # 펀딩비 차익거래 상태 복원
+    if arb_executor and "funding_arb" in saved_state:
+        funding_arb_state = saved_state["funding_arb"]
+        logger.info(f"펀딩비 차익거래 상태 복원: {list(funding_arb_state.keys())}")
+    if arb_risk_monitor and "arb_risk_monitor" in saved_state:
+        arb_risk_monitor.from_dict(saved_state["arb_risk_monitor"])
+        logger.info("ArbRiskMonitor 상태 복원")
 
     # 5. 거래소 포지션 동기화
     logger.info("시작 시 거래소 포지션 동기화...")
@@ -263,7 +668,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
 
     def _save_current_state() -> None:
         """현재 상태를 atomic write로 저장."""
-        executor._save_state(prev_positions, extra_state={
+        extra = {
             "circuit_breaker": risk_manager.circuit_breaker.to_dict(),
             "pnl_tracker": pnl_tracker.to_dict(),
             "virtual_positions": virtual_tracker.to_dict(),
@@ -271,7 +676,15 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             "peak_value": peak_value,
             "last_processed_bars": last_processed_bars,
             "last_trade_ids": list(last_trade_ids)[-100:],
-        }, state_path=state_path)
+        }
+        if arb_executor:
+            extra["funding_arb"] = funding_arb_state
+        if arb_risk_monitor:
+            extra["arb_risk_monitor"] = arb_risk_monitor.to_dict()
+        executor._save_state(prev_positions, extra_state=extra, state_path=state_path)
+
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
 
     while True:
         try:
@@ -285,7 +698,11 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 sym = _convert_symbol(sym_raw)
                 tf = cfg.get("strategy", {}).get("timeframe", "1h")
 
-                df = collector.fetch_ohlcv(symbol=sym, timeframe=tf, limit=2000)
+                since_dt = datetime.now(timezone.utc) - timedelta(hours=2000)
+                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                df = collector.fetch_ohlcv_bulk(
+                    symbol=sym, timeframe=tf, since=since_iso
+                )
                 current_bar = str(df["timestamp"].iloc[-1])
 
                 # 봉 중복 체크
@@ -296,6 +713,24 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 last_processed_bars[name] = current_bar
 
             if not data_dict:
+                # v1 데이터 없어도 차익거래 체크는 실행
+                if arb_executor and arb_config:
+                    try:
+                        balance = exchange.fetch_balance()
+                        pv = float(balance.get("total", {}).get("USDT", 0))
+                        _run_funding_arb_check(
+                            arb_executor, arb_config, pv,
+                            notifier, funding_arb_state, log_prefix,
+                            arb_risk_monitor,
+                        )
+                        last_funding_check = _check_funding_settlement(
+                            arb_executor, notifier, last_funding_check,
+                            funding_arb_state, log_prefix,
+                            arb_risk_monitor,
+                        )
+                        _save_current_state()
+                    except Exception as e:
+                        logger.error(f"차익거래 체크 오류: {e}", exc_info=True)
                 time.sleep(poll_interval)
                 continue
 
@@ -313,10 +748,20 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         if closed_pnl != 0:
                             risk_manager.circuit_breaker.record_trade(closed_pnl)
                             pnl_tracker.record_pnl(closed_pnl)
-                            # PnL을 가상 포지션 보유 전략에 분배 (FIFO: 첫 전략에 할당)
+                            # PnL을 가상 포지션 보유 전략에 비례 분배
                             if strategies_with_pos:
-                                pnl_strategy = strategies_with_pos[0]
-                                portfolio_risk.record_trade(pnl_strategy, closed_pnl)
+                                total_virt_size = sum(
+                                    virtual_tracker.get_position(s, sym).get("size", 0)
+                                    for s in strategies_with_pos
+                                )
+                                for s in strategies_with_pos:
+                                    virt_size = virtual_tracker.get_position(s, sym).get("size", 0)
+                                    ratio = (
+                                        virt_size / total_virt_size
+                                        if total_virt_size > 0
+                                        else 1.0 / len(strategies_with_pos)
+                                    )
+                                    portfolio_risk.record_trade(s, closed_pnl * ratio)
                             executor.record_closed_pnl(
                                 symbol=sym,
                                 pnl=closed_pnl,
@@ -339,8 +784,8 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                 if sig[0] == 0:
                     logger.info(f"{name}: 신호 중립 — 대기")
 
-            # 매수 시그널이 없으면 상태 저장 후 다음 루프
-            if not any(sig == 1 for sig, _ in signals.values()):
+            # 활성 시그널이 없으면 상태 저장 후 다음 루프
+            if not any(sig != 0 for sig, _ in signals.values()):
                 prev_positions = positions
                 _save_current_state()
                 time.sleep(poll_interval)
@@ -395,19 +840,36 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             }
 
             # 15. 자본 배분 → 주문 목록 (스케일링 적용)
+            current_prices: dict[str, float] = {}
+            for name in healthy_signals:
+                df_tmp = data_dict.get(name)
+                if df_tmp is not None and len(df_tmp) > 0:
+                    s_cfg = portfolio_manager.get_strategy_config(name)
+                    sym_raw = s_cfg.get("strategy", {}).get(
+                        "symbol", portfolio_manager.strategies[name].symbol
+                    )
+                    sym_ccxt = portfolio_manager._convert_symbol(sym_raw)
+                    current_prices[sym_ccxt] = float(df_tmp["close"].iloc[-1])
+
             orders = portfolio_manager.allocate(
                 healthy_signals,
                 portfolio_value,
                 virtual_tracker,
                 portfolio_scale=portfolio_scale,
                 strategy_scales=strategy_scales,
+                current_prices=current_prices,
             )
 
-            # 16. 각 주문 실행
+            # 16. 주문 실행 (2-Pass: 가상 포지션 일괄 등록 → 심볼별 단일 delta order)
+
+            # Pass 1: 리스크 체크 + 가상 포지션 일괄 등록
+            executed_symbols: dict[str, dict] = {}  # sym → 마지막 주문 정보
+            pass1_vpos_created: dict[str, list[str]] = {}  # sym → [strat_name, ...]
             for order in orders:
                 strat_name = order["strategy"]
                 sym = order["symbol"]
                 cfg = portfolio_manager.get_strategy_config(strat_name)
+                direction = order.get("direction", "long")
 
                 # 데이터에서 진입 가격 가져오기
                 df = data_dict.get(strat_name)
@@ -415,12 +877,14 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     continue
                 entry_price = float(df["close"].iloc[-1])
 
-                # 기존 포지션 체크
+                # 반대 방향 포지션 충돌 체크 (같은 방향은 가상 포지션 합산으로 처리)
                 existing_pos = positions.get(sym)
-                if existing_pos:
-                    if existing_pos["side"] == "long":
-                        logger.info(f"이미 {sym} long 포지션 보유 — 스킵")
-                        continue
+                if existing_pos and existing_pos["side"] != direction:
+                    logger.warning(
+                        f"{sym} 반대 방향 포지션 충돌: "
+                        f"기존={existing_pos['side']}, 신규={direction} — 스킵"
+                    )
+                    continue
 
                 # 전략별 리스크 체크
                 atr_value = _compute_atr(df)
@@ -449,53 +913,150 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     logger.warning(f"ATR 계산 불가 ({strat_name}) — 주문 스킵")
                     continue
 
+                size_pct = order.get("size_pct")
                 position_size = risk_manager.calculate_atr_position_size(
                     portfolio_value=portfolio_value,
                     atr=atr,
                     entry_price=entry_price,
+                    max_position_pct=size_pct,
                 )
 
-                # SL/TP 계산
-                sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
-                tp_pct = cfg.get("risk", {}).get("take_profit_pct")
+                # SL/TP 계산 — v2 전략이면 동적 SL/TP 사용
+                params = cfg.get("params", {})
+                if params.get("mode") == "regressor":
+                    atr_pct = atr / entry_price if atr > 0 else 0.02
+                    sl_atr_mult = params.get("sl_atr_mult", 2.0)
+                    tp_atr_mult = params.get("tp_atr_mult", 3.0)
+                    min_sl = params.get("min_sl_pct", 0.01)
+                    max_sl_val = params.get("max_sl_pct", 0.05)
+                    min_tp = params.get("min_tp_pct", 0.01)
+                    max_tp_val = params.get("max_tp_pct", 0.08)
+                    sl_pct = max(min_sl, min(atr_pct * sl_atr_mult, max_sl_val))
+                    tp_pct = max(min_tp, min(atr_pct * tp_atr_mult, max_tp_val))
+                else:
+                    sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
+                    tp_pct = cfg.get("risk", {}).get("take_profit_pct")
+
                 sl, tp = risk_manager.get_stop_take_profit(
-                    entry_price, "long",
+                    entry_price, direction,
                     stop_loss_pct=sl_pct,
                     take_profit_pct=tp_pct,
                 )
 
-                # 가상 포지션 생성
-                virtual_tracker.open(strat_name, sym, "long", position_size, entry_price)
+                # 가상 포지션 생성 (실제 주문은 아직)
+                virtual_tracker.open(strat_name, sym, direction, position_size, entry_price)
+                pass1_vpos_created.setdefault(sym, []).append(strat_name)
 
-                # 실제 주문: 가상 합산과 실제의 차이만큼
+                # 심볼별 마지막 주문 정보 기록 (Pass 2에서 사용)
+                executed_symbols[sym] = {
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "sl": sl,
+                    "tp": tp,
+                    "strat_name": strat_name,
+                    "order_type": cfg.get("execution", {}).get("order_type", "limit"),
+                    "signal": order.get("signal", 1),
+                }
+
+            # Pass 2: 심볼별 단일 delta order 실행
+            for sym, info in executed_symbols.items():
                 current_real = positions.get(sym, {})
                 deltas = virtual_tracker.get_delta_orders(sym, current_real)
 
+                # SL/TP: 동일 심볼 전략들의 가중 평균
+                strategies_on_sym = virtual_tracker.get_strategies_for_symbol(sym)
+                if len(strategies_on_sym) > 1:
+                    total_size = 0.0
+                    weighted_sl_pct = 0.0
+                    weighted_tp_pct = 0.0
+                    for s in strategies_on_sym:
+                        vpos = virtual_tracker.get_position(s, sym)
+                        s_cfg = portfolio_manager.get_strategy_config(s)
+                        s_params = s_cfg.get("params", {})
+                        if s_params.get("mode") == "regressor":
+                            s_df = data_dict.get(s)
+                            s_atr = _compute_atr(s_df) if s_df is not None else 0.0
+                            s_atr_pct = s_atr / info["entry_price"] if s_atr > 0 else 0.02
+                            s_sl_pct = max(
+                                s_params.get("min_sl_pct", 0.01),
+                                min(s_atr_pct * s_params.get("sl_atr_mult", 2.0),
+                                    s_params.get("max_sl_pct", 0.05)),
+                            )
+                            s_tp_pct = max(
+                                s_params.get("min_tp_pct", 0.01),
+                                min(s_atr_pct * s_params.get("tp_atr_mult", 3.0),
+                                    s_params.get("max_tp_pct", 0.08)),
+                            )
+                        else:
+                            s_sl_pct = s_cfg.get("risk", {}).get("stop_loss_pct", 0.021)
+                            s_tp_pct = s_cfg.get("risk", {}).get("take_profit_pct", 0.021)
+                        s_size = vpos.get("size", 0)
+                        total_size += s_size
+                        weighted_sl_pct += s_sl_pct * s_size
+                        weighted_tp_pct += s_tp_pct * s_size
+                    if total_size > 0:
+                        avg_sl_pct = weighted_sl_pct / total_size
+                        avg_tp_pct = weighted_tp_pct / total_size
+                        sl, tp = risk_manager.get_stop_take_profit(
+                            info["entry_price"], info["direction"],
+                            stop_loss_pct=avg_sl_pct,
+                            take_profit_pct=avg_tp_pct,
+                        )
+                    else:
+                        sl, tp = info["sl"], info["tp"]
+                else:
+                    sl, tp = info["sl"], info["tp"]
+
                 for delta in deltas:
+                    # Hedge Mode: v1 전략은 positionIdx=1(Buy side)
+                    v1_pos_idx = 1 if delta["symbol"] in hedge_mode_symbols_active else None
                     exec_order = executor.execute(
                         symbol=delta["symbol"],
                         side=delta["side"],
                         amount=delta["amount"],
-                        order_type=cfg.get("execution", {}).get("order_type", "limit"),
-                        price=entry_price,
-                        strategy_name=strat_name,
-                        signal_score=1,
+                        order_type=info["order_type"],
+                        price=info["entry_price"],
+                        strategy_name=info["strat_name"],
+                        signal_score=info["signal"],
                         stop_loss=sl,
                         take_profit=tp,
+                        position_idx=v1_pos_idx,
                     )
 
                     if exec_order:
                         msg = (
                             f"{log_prefix}주문 실행: {delta['side'].upper()} "
-                            f"{delta['amount']:.4f} {sym} @ {entry_price:.2f} "
-                            f"({strat_name})"
+                            f"{delta['amount']:.4f} {sym} @ {info['entry_price']:.2f} "
+                            f"({', '.join(strategies_on_sym)}, {info['direction']})"
                         )
                         logger.info(msg)
                         notifier.send_sync(msg)
+                    else:
+                        logger.error(f"주문 실행 실패: {sym} — 가상 포지션 롤백")
+                        for rollback_strat in pass1_vpos_created.get(sym, []):
+                            virtual_tracker.close(rollback_strat, sym)
+                            logger.info(f"가상 포지션 롤백: {rollback_strat} | {sym}")
 
-            # 17. 상태 업데이트 및 저장
+            # 17. 펀딩비 차익거래 체크
+            if arb_executor and arb_config:
+                try:
+                    _run_funding_arb_check(
+                        arb_executor, arb_config, portfolio_value,
+                        notifier, funding_arb_state, log_prefix,
+                        arb_risk_monitor,
+                    )
+                    last_funding_check = _check_funding_settlement(
+                        arb_executor, notifier, last_funding_check,
+                        funding_arb_state, log_prefix,
+                        arb_risk_monitor,
+                    )
+                except Exception as e:
+                    logger.error(f"차익거래 체크 오류: {e}", exc_info=True)
+
+            # 18. 상태 업데이트 및 저장
             prev_positions = executor.sync_positions()
             _save_current_state()
+            consecutive_errors = 0
 
         except KeyboardInterrupt:
             logger.info("사용자에 의해 종료")
@@ -505,8 +1066,32 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             except Exception as e:
                 logger.error(f"종료 시 상태 저장 실패: {e}")
             break
+        except (ConnectionError, TimeoutError, OSError) as e:
+            consecutive_errors += 1
+            logger.warning(
+                f"네트워크 오류 ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}"
+            )
+            backoff = min(poll_interval * (2 ** (consecutive_errors - 1)), 300)
+            time.sleep(backoff)
+            continue
         except Exception as e:
-            logger.error(f"실거래 루프 오류: {e}", exc_info=True)
+            consecutive_errors += 1
+            logger.error(
+                f"실거래 루프 오류 ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}",
+                exc_info=True,
+            )
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                logger.critical(
+                    f"연속 오류 {MAX_CONSECUTIVE_ERRORS}회 — 안전 종료"
+                )
+                notifier.send_sync(
+                    f"{log_prefix}[긴급] 연속 오류 한도 — 시스템 종료"
+                )
+                try:
+                    _save_current_state()
+                except Exception:
+                    pass
+                break
 
         time.sleep(poll_interval)
 

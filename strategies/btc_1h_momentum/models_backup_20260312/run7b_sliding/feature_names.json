@@ -1,0 +1,18 @@
+[
+  "ma_10_ratio",
+  "ma_30_ratio",
+  "ma_200_ratio",
+  "rsi_14",
+  "macd_hist",
+  "stoch_k",
+  "atr_14_pct",
+  "bb_width",
+  "bb_position",
+  "adx_14",
+  "return_1",
+  "volume_ratio",
+  "hour_sin",
+  "hour_cos",
+  "rsi_14_1d",
+  "ma_50_1d_ratio"
+]

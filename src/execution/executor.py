@@ -81,6 +81,7 @@ class OrderExecutor:
         signal_score: int = 0,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        position_idx: Optional[int] = None,
     ) -> Optional[dict]:
         """주문 실행.
 
@@ -97,6 +98,8 @@ class OrderExecutor:
             signal_score: 신호 점수 (기록용).
             stop_loss: 손절 가격.
             take_profit: 익절 가격.
+            position_idx: Hedge Mode 포지션 인덱스.
+                0=One-Way, 1=Buy side(롱), 2=Sell side(숏). None이면 미전달.
 
         Returns:
             거래소 주문 응답 딕셔너리, 실패 시 None.
@@ -109,6 +112,8 @@ class OrderExecutor:
 
         try:
             params = {}
+            if position_idx is not None:
+                params["positionIdx"] = position_idx
             if stop_loss is not None:
                 # SL 트리거를 0.1% 앞당겨 설정 (stop market 슬리피지 보상)
                 # long: SL가보다 약간 위에서 트리거 → 체결가가 SL가에 근접
@@ -177,6 +182,10 @@ class OrderExecutor:
         거래소에서 현재 포지션을 조회하고 로컬 상태 파일을 업데이트한다.
         미체결 주문 목록도 갱신한다.
 
+        Hedge Mode에서는 같은 심볼에 positionIdx가 다른 포지션이 공존할 수 있다.
+        positionIdx=2(Sell side)인 포지션은 별도 키(symbol::2)로 저장하여
+        v1 포지션(positionIdx=0 또는 1)과 분리한다.
+
         Returns:
             현재 포지션 딕셔너리.
         """
@@ -184,12 +193,16 @@ class OrderExecutor:
             positions = self.exchange.fetch_positions()
             active = {}
             for pos in positions:
-                if float(pos.get("contracts", 0)) > 0:
-                    active[pos["symbol"]] = {
+                if float(pos.get("contracts") or 0) > 0:
+                    pos_idx = int(pos.get("info", {}).get("positionIdx", 0))
+                    # Hedge Mode에서 positionIdx=2(Sell side)는 별도 키로 저장
+                    key = f"{pos['symbol']}::2" if pos_idx == 2 else pos["symbol"]
+                    active[key] = {
                         "side": pos["side"],
-                        "size": float(pos["contracts"]),
-                        "entry_price": float(pos.get("entryPrice", 0)),
-                        "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
+                        "size": float(pos.get("contracts") or 0),
+                        "entry_price": float(pos.get("entryPrice") or 0),
+                        "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
+                        "position_idx": pos_idx,
                     }
 
             # 미체결 주문 갱신
@@ -241,6 +254,7 @@ class OrderExecutor:
         symbol: str,
         position: dict,
         strategy_name: str = "",
+        position_idx: Optional[int] = None,
     ) -> Optional[dict]:
         """기존 포지션을 시장가로 청산.
 
@@ -248,6 +262,7 @@ class OrderExecutor:
             symbol: 거래 심볼.
             position: 포지션 정보 딕셔너리 (side, size 포함).
             strategy_name: 전략 이름 (기록용).
+            position_idx: Hedge Mode 포지션 인덱스. None이면 미전달.
 
         Returns:
             거래소 주문 응답, 실패 시 None.
@@ -264,6 +279,7 @@ class OrderExecutor:
             order_type="market",
             strategy_name=strategy_name,
             signal_score=0,
+            position_idx=position_idx,
         )
 
     def record_closed_pnl(

@@ -1,0 +1,39 @@
+# strategies/funding_arb/config.yaml
+# 펀딩비 차익거래 (Buy & Hold) 전략 설정
+
+strategy:
+  name: funding_arb
+  type: funding_arb
+  symbols:
+    - {spot: "BTC/USDT", perp: "BTC/USDT:USDT", coin: "BTC"}
+    - {spot: "ETH/USDT", perp: "ETH/USDT:USDT", coin: "ETH"}
+
+params:
+  leverage: 2
+
+  # 델타 모니터링
+  max_delta_pct: 0.05               # 최대 델타 허용 5%
+  rebalance_delta_pct: 0.03         # 델타 3% 초과 시 리밸런스 알림
+
+execution:
+  order_type: market                # 현물+선물 동시 실행은 시장가 권장
+
+risk:
+  max_position_pct: 0.40
+
+  # 베이시스 모니터링
+  basis_warn_pct: 0.01              # 베이시스 ±1% → 경고
+  basis_critical_pct: 0.02          # 베이시스 ±2% → 긴급
+
+  # 마진율 모니터링
+  margin_warn_pct: 0.50             # 마진 여유 50% 미만 → 경고
+  margin_critical_pct: 0.30         # 마진 여유 30% 미만 → 긴급
+
+  # 펀딩비 추세
+  max_consecutive_negative: 6       # 연속 음수 6회(48시간) → 긴급
+
+  # 슬리피지
+  max_entry_slippage_pct: 0.005     # 진입 슬리피지 0.5% 초과 → 경고
+
+  # 누적 손실
+  max_cumulative_loss_pct: 0.03     # 누적 음수 펀딩비 3% 초과 → 경고

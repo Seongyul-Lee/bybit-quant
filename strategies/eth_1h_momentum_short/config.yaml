@@ -1,0 +1,46 @@
+strategy:
+  name: eth_1h_momentum_short
+  type: lgbm_short_classifier
+  symbol: ETHUSDT
+  timeframe: 1h
+
+params:
+  model_path: strategies/eth_1h_momentum_short/models/latest.txt
+  feature_names_path: strategies/eth_1h_momentum_short/models/feature_names.json
+  confidence_threshold: 0.44
+  upper_barrier_multiplier: 3.0     # 숏의 SL (가격 상승 배리어)
+  lower_barrier_multiplier: 3.0     # 숏의 TP (가격 하락 배리어)
+  max_holding_period: 24
+  models_dir: strategies/eth_1h_momentum_short/models
+
+  # 숏 전용 라벨러
+  labeler_type: short_triple_barrier
+
+  ensemble_folds: [8, 14]
+
+  # 펀딩비 필터 (숏: 방향 반전)
+  funding_filter:
+    enabled: true
+    zscore_thresholds:
+      - {zscore_below: 0, confidence: 0.44}
+      - {zscore_below: 2, confidence: 0.42}
+
+retrain:
+  enabled: true
+  interval_days: 30
+  window_type: sliding
+  window_months: 12
+  min_pf_ratio: 0.9
+  auto_ensemble: true
+  ensemble_n_folds: 2
+  use_optuna: false
+
+execution:
+  order_type: limit
+  limit_offset: 0.001
+  fee_rate: 0.00055
+
+risk:
+  max_position_pct: 0.15
+  stop_loss_pct: 0.021
+  take_profit_pct: 0.021

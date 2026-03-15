@@ -1,10 +1,11 @@
 """모델 평가 모듈.
 
-ML 메트릭과 트레이딩 메트릭을 통합 평가한다.
+ML 메트릭(분류/회귀)과 트레이딩 메트릭을 통합 평가한다.
 """
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 from sklearn.metrics import f1_score, roc_auc_score
 
 from src.analytics.reporter import Reporter
@@ -42,6 +43,53 @@ class ModelEvaluator:
         return {
             "f1_binary": float(f1),
             "auc_roc": float(auc),
+        }
+
+    @staticmethod
+    def regression_metrics(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+    ) -> dict:
+        """회귀 모델 성능 지표 계산.
+
+        Args:
+            y_true: 실제 수익률.
+            y_pred: 예측 수익률.
+
+        Returns:
+            {"mae", "ic", "directional_accuracy"} 딕셔너리.
+        """
+        mae = float(np.mean(np.abs(y_pred - y_true)))
+        ic, _ = spearmanr(y_pred, y_true)
+        ic = float(ic) if not np.isnan(ic) else 0.0
+        dir_acc = float(np.mean(np.sign(y_pred) == np.sign(y_true)))
+
+        return {
+            "mae": mae,
+            "ic": ic,
+            "directional_accuracy": dir_acc,
+        }
+
+    @staticmethod
+    def check_overfitting_regression(
+        train_mae: float,
+        val_mae: float,
+        threshold: float = 0.005,
+    ) -> dict:
+        """회귀 모델 과적합 판단.
+
+        Args:
+            train_mae: 학습 MAE.
+            val_mae: 검증 MAE.
+            threshold: 허용 MAE 갭.
+
+        Returns:
+            {"gap", "is_overfit"}.
+        """
+        gap = val_mae - train_mae
+        return {
+            "gap": float(gap),
+            "is_overfit": gap > threshold,
         }
 
     @staticmethod
