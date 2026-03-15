@@ -98,16 +98,20 @@ class ArbExecutor:
         )
         if not spot_order:
             logger.error("현물 매수 실패 — 선물 숏 롤백")
-            # 롤백: 선물 숏 청산 (Hedge Mode: positionIdx=2)
-            self.perp.execute(
-                symbol=symbol_perp,
-                side="buy",
-                amount=amount,
-                order_type="market",
-                strategy_name="funding_arb_rollback",
-                signal_score=0,
-                position_idx=2,
-            )
+            # 롤백: 실제 체결량 기준으로 선물 숏 청산 (Hedge Mode: positionIdx=2)
+            actual_filled = float(perp_order.get("filled", 0))
+            if actual_filled > 0:
+                self.perp.execute(
+                    symbol=symbol_perp,
+                    side="buy",
+                    amount=actual_filled,
+                    order_type="market",
+                    strategy_name="funding_arb_rollback",
+                    signal_score=0,
+                    position_idx=2,
+                )
+            else:
+                logger.warning("선물 숏 체결 수량 0 — 롤백 불필요")
             return result
         result["spot_order"] = spot_order
 

@@ -40,8 +40,7 @@ class TestFundingArbStrategy:
         from strategies.funding_arb.strategy import FundingArbStrategy
 
         config = {
-            "symbol_spot": "BTC/USDT",
-            "symbol_perp": "BTC/USDT:USDT",
+            "symbol": "BTC/USDT:USDT",
             "leverage": 2,
             "position_pct": 0.40,
         }
@@ -65,7 +64,7 @@ class TestFundingArbStrategy:
         import pandas as pd
         from strategies.funding_arb.strategy import FundingArbStrategy
 
-        config = {"symbol_spot": "BTC/USDT", "symbol_perp": "BTC/USDT:USDT"}
+        config = {"symbol": "BTC/USDT:USDT"}
         strategy = FundingArbStrategy(config)
 
         df = pd.DataFrame({
@@ -83,7 +82,7 @@ class TestFundingArbStrategy:
         from strategies.funding_arb.strategy import FundingArbStrategy
         from src.strategies.base import BaseStrategy
 
-        config = {"symbol_spot": "BTC/USDT", "symbol_perp": "BTC/USDT:USDT"}
+        config = {"symbol": "BTC/USDT:USDT"}
         strategy = FundingArbStrategy(config)
         assert isinstance(strategy, BaseStrategy)
         assert strategy.symbol == "BTC/USDT:USDT"

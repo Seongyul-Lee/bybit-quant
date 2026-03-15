@@ -21,8 +21,6 @@ class FundingArbStrategy(BaseStrategy):
     - 펀딩비: signal → ArbExecutor.open_position() (현물+선물 동시)
 
     Attributes:
-        symbol_spot: 현물 심볼 (예: "BTC/USDT").
-        symbol_perp: 선물 심볼 (예: "BTC/USDT:USDT").
         leverage: 선물 레버리지.
         position_pct: 자본 대비 포지션 비율.
     """
@@ -34,11 +32,8 @@ class FundingArbStrategy(BaseStrategy):
             config: 전략 설정 (params 섹션).
         """
         super().__init__(config)
-        self.symbol_spot = config.get("symbol_spot", "BTC/USDT")
-        self.symbol_perp = config.get("symbol_perp", "BTC/USDT:USDT")
         self.leverage = config.get("leverage", 2)
         self.position_pct = config.get("position_pct", 0.40)
-        self.symbol = self.symbol_perp
 
     def generate_signal(self, df: pd.DataFrame) -> tuple[int, float]:
         """Buy & Hold: 항상 1(진입/유지).

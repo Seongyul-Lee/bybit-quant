@@ -493,7 +493,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     # === Hedge Mode (Both Sides) 설정 ===
     # Hedge Mode에서는 같은 심볼에 롱(positionIdx=1)과 숏(positionIdx=2)을 동시 보유 가능.
     # v1 전략은 positionIdx=1(Buy side), funding_arb는 positionIdx=2(Sell side)로 분리.
-    hedge_mode_enabled = False
+    hedge_mode_symbols_active: set[str] = set()
     hedge_mode_symbols: set[str] = set()
 
     arb_config_tmp = _load_funding_arb_config(portfolio_config)
@@ -503,24 +503,23 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
         hedge_mode_symbols = {s["perp"] for s in arb_symbols_tmp if s["perp"] in v1_perp_symbols}
 
         if hedge_mode_symbols:
-            all_success = True
             for sym in hedge_mode_symbols:
                 try:
                     exchange.set_position_mode(True, sym)
                     logger.info(f"Hedge Mode 전환 성공: {sym}")
+                    hedge_mode_symbols_active.add(sym)
                 except Exception as e:
                     err_msg = str(e)
                     # 이미 Hedge Mode인 경우도 성공으로 처리
                     if "already" in err_msg.lower() or "position mode is not modified" in err_msg.lower():
                         logger.info(f"Hedge Mode 이미 활성: {sym}")
+                        hedge_mode_symbols_active.add(sym)
                     else:
                         logger.warning(f"Hedge Mode 전환 실패: {sym} — {e}")
-                        all_success = False
 
-            if all_success:
-                hedge_mode_enabled = True
+            if hedge_mode_symbols_active:
                 logger.info(
-                    f"Hedge Mode 활성화 완료: {hedge_mode_symbols} — "
+                    f"Hedge Mode 활성화 완료: {hedge_mode_symbols_active} — "
                     f"v1(positionIdx=1)과 arb(positionIdx=2) 동시 운용 가능"
                 )
             else:
@@ -539,10 +538,10 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
     if arb_config:
         arb_symbols = arb_config.get("strategy", {}).get("symbols", [])
 
-        if hedge_mode_enabled:
+        if hedge_mode_symbols_active:
             # Hedge Mode에서는 v1과 동일 심볼도 허용
             filtered = arb_symbols
-            if hedge_mode_symbols & v1_perp_symbols:
+            if hedge_mode_symbols_active & v1_perp_symbols:
                 logger.info(
                     f"Hedge Mode: v1 충돌 심볼 허용 — {hedge_mode_symbols & v1_perp_symbols}"
                 )
@@ -683,6 +682,9 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
         if arb_risk_monitor:
             extra["arb_risk_monitor"] = arb_risk_monitor.to_dict()
         executor._save_state(prev_positions, extra_state=extra, state_path=state_path)
+
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
 
     while True:
         try:
@@ -838,18 +840,31 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             }
 
             # 15. 자본 배분 → 주문 목록 (스케일링 적용)
+            current_prices: dict[str, float] = {}
+            for name in healthy_signals:
+                df_tmp = data_dict.get(name)
+                if df_tmp is not None and len(df_tmp) > 0:
+                    s_cfg = portfolio_manager.get_strategy_config(name)
+                    sym_raw = s_cfg.get("strategy", {}).get(
+                        "symbol", portfolio_manager.strategies[name].symbol
+                    )
+                    sym_ccxt = portfolio_manager._convert_symbol(sym_raw)
+                    current_prices[sym_ccxt] = float(df_tmp["close"].iloc[-1])
+
             orders = portfolio_manager.allocate(
                 healthy_signals,
                 portfolio_value,
                 virtual_tracker,
                 portfolio_scale=portfolio_scale,
                 strategy_scales=strategy_scales,
+                current_prices=current_prices,
             )
 
             # 16. 주문 실행 (2-Pass: 가상 포지션 일괄 등록 → 심볼별 단일 delta order)
 
             # Pass 1: 리스크 체크 + 가상 포지션 일괄 등록
             executed_symbols: dict[str, dict] = {}  # sym → 마지막 주문 정보
+            pass1_vpos_created: dict[str, list[str]] = {}  # sym → [strat_name, ...]
             for order in orders:
                 strat_name = order["strategy"]
                 sym = order["symbol"]
@@ -930,6 +945,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
 
                 # 가상 포지션 생성 (실제 주문은 아직)
                 virtual_tracker.open(strat_name, sym, direction, position_size, entry_price)
+                pass1_vpos_created.setdefault(sym, []).append(strat_name)
 
                 # 심볼별 마지막 주문 정보 기록 (Pass 2에서 사용)
                 executed_symbols[sym] = {
@@ -993,7 +1009,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
 
                 for delta in deltas:
                     # Hedge Mode: v1 전략은 positionIdx=1(Buy side)
-                    v1_pos_idx = 1 if (hedge_mode_enabled and delta["symbol"] in hedge_mode_symbols) else None
+                    v1_pos_idx = 1 if delta["symbol"] in hedge_mode_symbols_active else None
                     exec_order = executor.execute(
                         symbol=delta["symbol"],
                         side=delta["side"],
@@ -1015,6 +1031,11 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                         )
                         logger.info(msg)
                         notifier.send_sync(msg)
+                    else:
+                        logger.error(f"주문 실행 실패: {sym} — 가상 포지션 롤백")
+                        for rollback_strat in pass1_vpos_created.get(sym, []):
+                            virtual_tracker.close(rollback_strat, sym)
+                            logger.info(f"가상 포지션 롤백: {rollback_strat} | {sym}")
 
             # 17. 펀딩비 차익거래 체크
             if arb_executor and arb_config:
@@ -1035,6 +1056,7 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             # 18. 상태 업데이트 및 저장
             prev_positions = executor.sync_positions()
             _save_current_state()
+            consecutive_errors = 0
 
         except KeyboardInterrupt:
             logger.info("사용자에 의해 종료")
@@ -1044,8 +1066,32 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
             except Exception as e:
                 logger.error(f"종료 시 상태 저장 실패: {e}")
             break
+        except (ConnectionError, TimeoutError, OSError) as e:
+            consecutive_errors += 1
+            logger.warning(
+                f"네트워크 오류 ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}"
+            )
+            backoff = min(poll_interval * (2 ** (consecutive_errors - 1)), 300)
+            time.sleep(backoff)
+            continue
         except Exception as e:
-            logger.error(f"실거래 루프 오류: {e}", exc_info=True)
+            consecutive_errors += 1
+            logger.error(
+                f"실거래 루프 오류 ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}",
+                exc_info=True,
+            )
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                logger.critical(
+                    f"연속 오류 {MAX_CONSECUTIVE_ERRORS}회 — 안전 종료"
+                )
+                notifier.send_sync(
+                    f"{log_prefix}[긴급] 연속 오류 한도 — 시스템 종료"
+                )
+                try:
+                    _save_current_state()
+                except Exception:
+                    pass
+                break
 
         time.sleep(poll_interval)
 

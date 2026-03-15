@@ -137,6 +137,7 @@ class PortfolioManager:
         virtual_tracker: VirtualPositionTracker,
         portfolio_scale: float = 1.0,
         strategy_scales: dict[str, float] | None = None,
+        current_prices: dict[str, float] | None = None,
     ) -> list[dict]:
         """시그널을 기반으로 주문 목록 생성.
 
@@ -232,10 +233,14 @@ class PortfolioManager:
             remaining_slots -= 1
 
         # 동일 심볼 합산 캡 적용
-        orders = self._apply_symbol_cap(orders, portfolio_value, virtual_tracker)
+        orders = self._apply_symbol_cap(
+            orders, portfolio_value, virtual_tracker, current_prices
+        )
 
         # 전체 노출 캡 적용
-        orders = self._apply_total_cap(orders, portfolio_value, virtual_tracker)
+        orders = self._apply_total_cap(
+            orders, portfolio_value, virtual_tracker, current_prices
+        )
 
         return orders
 
@@ -244,6 +249,7 @@ class PortfolioManager:
         orders: list[dict],
         portfolio_value: float,
         virtual_tracker: VirtualPositionTracker,
+        current_prices: dict[str, float] | None = None,
     ) -> list[dict]:
         """동일 심볼 합산이 max_symbol_exposure 초과 시 비례 축소.
 
@@ -251,10 +257,13 @@ class PortfolioManager:
             orders: 주문 목록.
             portfolio_value: 포트폴리오 가치.
             virtual_tracker: 가상 포지션 추적기.
+            current_prices: {심볼: 현재가} 딕셔너리. None이면 entry_price 사용.
 
         Returns:
             조정된 주문 목록.
         """
+        current_prices = current_prices or {}
+
         # 심볼별 신규 주문 합산
         symbol_new_exposure: dict[str, float] = {}
         for order in orders:
@@ -264,18 +273,19 @@ class PortfolioManager:
             )
 
         for sym, new_pct in symbol_new_exposure.items():
-            # 기존 가상 포지션의 노출 계산 (대략적)
+            # 기존 가상 포지션의 노출 계산 (현재가 반영)
             existing_pct = 0.0
             for strat_positions in virtual_tracker.virtual_positions.values():
                 if sym in strat_positions:
                     pos = strat_positions[sym]
                     if portfolio_value > 0:
+                        price = current_prices.get(sym, pos["entry_price"])
                         existing_pct += (
-                            pos["size"] * pos["entry_price"]
+                            pos["size"] * price
                         ) / portfolio_value
 
             total_pct = existing_pct + new_pct
-            if total_pct > self.max_symbol_exposure:
+            if total_pct > self.max_symbol_exposure and new_pct > 0:
                 # 비례 축소
                 scale = max(0, self.max_symbol_exposure - existing_pct) / new_pct
                 for order in orders:
@@ -293,6 +303,7 @@ class PortfolioManager:
         orders: list[dict],
         portfolio_value: float,
         virtual_tracker: VirtualPositionTracker,
+        current_prices: dict[str, float] | None = None,
     ) -> list[dict]:
         """전체 합산이 max_total_exposure 초과 시 비례 축소.
 
@@ -300,17 +311,21 @@ class PortfolioManager:
             orders: 주문 목록.
             portfolio_value: 포트폴리오 가치.
             virtual_tracker: 가상 포지션 추적기.
+            current_prices: {심볼: 현재가} 딕셔너리. None이면 entry_price 사용.
 
         Returns:
             조정된 주문 목록.
         """
-        # 기존 전체 노출
+        current_prices = current_prices or {}
+
+        # 기존 전체 노출 (현재가 반영)
         existing_pct = 0.0
         if portfolio_value > 0:
             for strat_positions in virtual_tracker.virtual_positions.values():
-                for pos in strat_positions.values():
+                for sym, pos in strat_positions.items():
+                    price = current_prices.get(sym, pos["entry_price"])
                     existing_pct += (
-                        pos["size"] * pos["entry_price"]
+                        pos["size"] * price
                     ) / portfolio_value
 
         new_pct = sum(o["size_pct"] for o in orders)
