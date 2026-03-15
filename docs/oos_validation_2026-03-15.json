@@ -1,0 +1,50 @@
+{
+  "date": "2026-03-15",
+  "strategies": {
+    "btc_1h_momentum": {
+      "passed": true,
+      "conservative": {
+        "is_pf": 2.1748,
+        "pv_pf": 2.0863,
+        "pv_return": 1.3384,
+        "pv_trades": 38,
+        "pf_drop": 4.07
+      },
+      "strict_oos": {
+        "pf": 0.5589,
+        "trades": 16,
+        "total_return": -2.4051
+      }
+    },
+    "eth_1h_momentum": {
+      "passed": true,
+      "conservative": {
+        "is_pf": 2.1990,
+        "pv_pf": 1.9292,
+        "pv_return": 1.0241,
+        "pv_trades": 36,
+        "pf_drop": 12.27
+      },
+      "strict_oos": {
+        "pf": 0.6374,
+        "trades": 26,
+        "total_return": -3.7658
+      }
+    },
+    "btc_1h_mean_reversion": {
+      "passed": true,
+      "conservative": {
+        "is_pf": 2.3967,
+        "pv_pf": 2.3528,
+        "pv_return": 1.6054,
+        "pv_trades": 26,
+        "pf_drop": 1.83
+      },
+      "strict_oos": {
+        "pf": 0.5764,
+        "trades": 28,
+        "total_return": -4.4292
+      }
+    }
+  }
+}

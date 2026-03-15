@@ -47,24 +47,6 @@ def load_strategy(strategy_name: str):
     elif strategy_name == "btc_1h_mean_reversion":
         from strategies.btc_1h_mean_reversion.strategy import MeanReversionStrategy
         return MeanReversionStrategy(config=params)
-    elif strategy_name == "btc_1h_momentum_v2":
-        from strategies.btc_1h_momentum_v2.strategy import BTCMomentumV2Strategy
-        return BTCMomentumV2Strategy(config=params)
-    elif strategy_name == "eth_1h_momentum_v2":
-        from strategies.eth_1h_momentum_v2.strategy import ETHMomentumV2Strategy
-        return ETHMomentumV2Strategy(config=params)
-    elif strategy_name == "btc_1h_mean_reversion_v2":
-        from strategies.btc_1h_mean_reversion_v2.strategy import BTCMeanReversionV2Strategy
-        return BTCMeanReversionV2Strategy(config=params)
-    elif strategy_name == "btc_1h_momentum_short":
-        from strategies.btc_1h_momentum_short.strategy import BTCMomentumShortStrategy
-        return BTCMomentumShortStrategy(config=params)
-    elif strategy_name == "eth_1h_momentum_short":
-        from strategies.eth_1h_momentum_short.strategy import ETHMomentumShortStrategy
-        return ETHMomentumShortStrategy(config=params)
-    elif strategy_name == "btc_1h_mean_reversion_short":
-        from strategies.btc_1h_mean_reversion_short.strategy import BTCMeanReversionShortStrategy
-        return BTCMeanReversionShortStrategy(config=params)
     elif strategy_name == "funding_arb":
         from strategies.funding_arb.strategy import FundingArbStrategy
         return FundingArbStrategy(config=params)
@@ -921,21 +903,9 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     max_position_pct=size_pct,
                 )
 
-                # SL/TP 계산 — v2 전략이면 동적 SL/TP 사용
-                params = cfg.get("params", {})
-                if params.get("mode") == "regressor":
-                    atr_pct = atr / entry_price if atr > 0 else 0.02
-                    sl_atr_mult = params.get("sl_atr_mult", 2.0)
-                    tp_atr_mult = params.get("tp_atr_mult", 3.0)
-                    min_sl = params.get("min_sl_pct", 0.01)
-                    max_sl_val = params.get("max_sl_pct", 0.05)
-                    min_tp = params.get("min_tp_pct", 0.01)
-                    max_tp_val = params.get("max_tp_pct", 0.08)
-                    sl_pct = max(min_sl, min(atr_pct * sl_atr_mult, max_sl_val))
-                    tp_pct = max(min_tp, min(atr_pct * tp_atr_mult, max_tp_val))
-                else:
-                    sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
-                    tp_pct = cfg.get("risk", {}).get("take_profit_pct")
+                # SL/TP 계산
+                sl_pct = cfg.get("risk", {}).get("stop_loss_pct")
+                tp_pct = cfg.get("risk", {}).get("take_profit_pct")
 
                 sl, tp = risk_manager.get_stop_take_profit(
                     entry_price, direction,
@@ -972,24 +942,8 @@ def run_live(strategy_name: str | None = None, testnet: bool = False) -> None:
                     for s in strategies_on_sym:
                         vpos = virtual_tracker.get_position(s, sym)
                         s_cfg = portfolio_manager.get_strategy_config(s)
-                        s_params = s_cfg.get("params", {})
-                        if s_params.get("mode") == "regressor":
-                            s_df = data_dict.get(s)
-                            s_atr = _compute_atr(s_df) if s_df is not None else 0.0
-                            s_atr_pct = s_atr / info["entry_price"] if s_atr > 0 else 0.02
-                            s_sl_pct = max(
-                                s_params.get("min_sl_pct", 0.01),
-                                min(s_atr_pct * s_params.get("sl_atr_mult", 2.0),
-                                    s_params.get("max_sl_pct", 0.05)),
-                            )
-                            s_tp_pct = max(
-                                s_params.get("min_tp_pct", 0.01),
-                                min(s_atr_pct * s_params.get("tp_atr_mult", 3.0),
-                                    s_params.get("max_tp_pct", 0.08)),
-                            )
-                        else:
-                            s_sl_pct = s_cfg.get("risk", {}).get("stop_loss_pct", 0.021)
-                            s_tp_pct = s_cfg.get("risk", {}).get("take_profit_pct", 0.021)
+                        s_sl_pct = s_cfg.get("risk", {}).get("stop_loss_pct", 0.021)
+                        s_tp_pct = s_cfg.get("risk", {}).get("take_profit_pct", 0.021)
                         s_size = vpos.get("size", 0)
                         total_size += s_size
                         weighted_sl_pct += s_sl_pct * s_size
