@@ -13,8 +13,10 @@ LightGBM 2클래스 분류(롱 전용, 앙상블 지원) 전략을 멀티 심볼
 | btc_1h_momentum | BTC/USDT | 1h | fold [11, 13] | 2.09 |
 | eth_1h_momentum | ETH/USDT | 1h | fold [12, 14] | 2.11 |
 | btc_1h_mean_reversion | BTC/USDT | 1h | fold 14 (단일) | 2.35 |
+| funding_arb | BTC+ETH | - | - (Buy & Hold) | - |
 
-포트폴리오: 전략당 20% 균등 배분, 전체 노출 60% 상한, 동일 심볼 30% 상한.
+포트폴리오: ML 전략은 전략당 20% 균등 배분, 전체 노출 60% 상한, 동일 심볼 30% 상한.
+funding_arb는 별도 자본 40% 배분 (PortfolioManager 미경유, ArbExecutor 직접 실행).
 
 ---
 
@@ -130,7 +132,10 @@ python main.py --mode live    # portfolio.yaml의 활성 전략 모두 로드
 
 ### 실거래 흐름 (멀티 전략)
 
+Bybit Hedge Mode 활성화 — 동일 심볼에서 v1 전략과 funding_arb가 양방향 포지션으로 동시 운용 가능.
+
 ```
+[ML 전략 — 봉 마감 주기]
 봉 마감 감지
   → 각 전략의 generate_signal(df) → (signal, probability)
   → PortfolioManager.allocate() → 자본 배분 + 주문 목록
@@ -138,6 +143,12 @@ python main.py --mode live    # portfolio.yaml의 활성 전략 모두 로드
   → 전략별 RiskManager.check_all() → 개별 리스크 체크
   → VirtualPositionTracker → 가상→실제 포지션 변환
   → OrderExecutor.execute() → 거래소 주문 제출
+
+[funding_arb — 별도 실행 경로]
+펀딩비 수집
+  → FundingArbStrategy.generate_signal() → 진입/청산 판단
+  → ArbRiskMonitor.check_all() → basis/margin/funding trend 체크
+  → ArbExecutor.execute() → spot+perp 동시 실행 (SpotExecutor + OrderExecutor)
 ```
 
 ### 백테스트 흐름
@@ -153,7 +164,7 @@ data/processed/ Parquet 로드
 
 ```
 data/processed/ Parquet 로드
-  → FeatureEngine.compute_all_features() → ~19개 피처
+  → FeatureEngine.compute_all_features() → ~43개 피처 계산 → 선별 ~18개 사용
   → TripleBarrierLabeler / MeanReversionLabeler → 2클래스 라벨 (1=매수/0=비매수)
   → WalkForwardTrainer.run() → Sliding/Expanding 윈도우 학습 + Optuna 튜닝
   → 모델 저장 (strategies/{name}/models/)
@@ -170,6 +181,7 @@ data/processed/ Parquet 로드
 |------|------|
 | 전략 레벨 (RiskManager) | SL/TP, 포지션 크기, 일/월 손실 한도, CircuitBreaker |
 | 포트폴리오 레벨 (PortfolioRiskManager) | 전체 MDD 한도, 전략 자동 비활성화 |
+| 펀딩 아비트리지 (ArbRiskMonitor) | basis divergence, margin utilization, funding trend, 진입 슬리피지 |
 
 ### 주요 파라미터
 
@@ -203,8 +215,8 @@ src/
   data/                collector.py, processor.py
   portfolio/           manager.py, risk.py, virtual_position.py
   strategies/          base.py (BaseStrategy ABC)
-  risk/                manager.py (RiskManager + CircuitBreaker)
-  execution/           executor.py (주문 실행, 멱등성)
+  risk/                manager.py (RiskManager + CircuitBreaker), arb_monitor.py (ArbRiskMonitor)
+  execution/           executor.py (주문 실행, 멱등성), arb_executor.py, spot_executor.py
   analytics/           reporter.py
   utils/               logger.py, notify.py
 strategies/
@@ -212,6 +224,7 @@ strategies/
   btc_1h_momentum/     BTC 1h 모멘텀 전략 (strategy.py, config.yaml, models/)
   eth_1h_momentum/     ETH 1h 모멘텀 전략 (strategy.py, config.yaml, models/)
   btc_1h_mean_reversion/ BTC 1h 평균회귀 전략 (strategy.py, labeler.py, config.yaml, models/)
+  funding_arb/         펀딩비 차익거래 전략 (config.yaml, Buy & Hold, ArbExecutor 경유)
 train_lgbm.py          학습 CLI (--strategy로 전략 지정)
 oos_validation.py      OOS 검증 (--strategy로 전략 지정, --json 구조화 출력)
 retrain.py             주기적 재학습 파이프라인 (증분수집→학습→OOS 검증→교체)
@@ -222,6 +235,8 @@ main.py                실거래 진입점 (portfolio.yaml 기반 멀티 전략)
 ---
 
 ## 새 전략 추가
+
+### ML 전략 (LightGBM 기반)
 
 1. `strategies/{name}/` 폴더 생성 — `strategy.py`, `config.yaml`, `models/`
 2. `strategy.py`에서 `BaseStrategy` 상속, `generate_signal(df) → (int, float)` 구현
@@ -235,6 +250,13 @@ python train_lgbm.py --strategy {name} --optuna-trials 100
 python oos_validation.py --strategy {name}
 # OOS SUCCESS 시 portfolio.yaml에 추가
 ```
+
+### 규칙 기반 전략 (funding_arb 등)
+
+ML 학습이 필요 없는 전략은 별도 실행 경로를 사용한다.
+- `strategy.py`에서 규칙 기반 시그널 생성
+- `config/portfolio.yaml`의 `funding_arb` 섹션에서 자본 배분 설정
+- `ArbExecutor` 등 전용 실행기 사용 (PortfolioManager 미경유)
 
 ---
 
@@ -274,7 +296,7 @@ python -m pytest tests/test_risk_manager.py -v     # 단일 파일
 | 파일 | 설명 |
 |------|------|
 | `docs/MULTI_STRATEGY_ARCHITECTURE.md` | 멀티 전략 포트폴리오 아키텍처 설계 |
-| `docs/ARCHITECTURE.md` | 시스템 아키텍처 및 모듈 설계 |
-| `docs/STRATEGY.md` | 전략 개발 가이드 |
-| `docs/RISK_MANAGEMENT.md` | 리스크 관리 원칙 및 구현 |
-| `docs/*.md` | 모델 분석 리포트 |
+| `docs/FUNDING_ARB_ARCHITECTURE.md` | 펀딩비 차익거래 아키텍처 |
+| `docs/MAINNET_DEPLOYMENT_PLAN.md` | 메인넷 배포 계획 |
+| `docs/REGRESSION_ARCHITECTURE.md` | 회귀 전략 아키텍처 |
+| `docs/lgbm_backtest_metrics.md` | LightGBM 백테스트 지표 설명 |
